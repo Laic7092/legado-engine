@@ -60,8 +60,10 @@ make test-c   # 用 C 程序调用 open / version / close
 
 ## 线程
 
-一个 handle 同一时间只在一个线程上使用。`search` / `toc` / `content` 会发
-HTTP 并执行 JS，调用方应放在工作线程。
+一个 handle 可以从多个线程同时使用：JS 上下文、当前书源和请求上下文都是
+thread-local，cookie / HTTP / JS 存储有锁。每个线程的返回值和错误各有一份，
+指针在下一次同一线程调用前有效。`search` / `toc` / `content` 会发 HTTP 并执行
+JS，调用方应放在工作线程；多个书源搜索可以直接并发调用同一个 handle。
 
 ## 限制
 

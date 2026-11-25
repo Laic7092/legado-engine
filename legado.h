@@ -2,9 +2,11 @@
  * legado-engine: the Legado (阅读3.0) book-source engine behind a C ABI.
  *
  * A handle owns the source HTTP clients (cookies, proxy), the rule engine,
- * the JavaScript runtime and the variable store. Use it from one thread at a
- * time. Every const char* returned by a legado_* call is UTF-8 and is owned by
- * the engine: it stays valid until the next call on that handle (or, for
+ * the JavaScript runtime and the variable store. It can be used from several
+ * threads at once: the JavaScript context, active source and request context
+ * are thread-local, and cookies, HTTP clients and JS storage are locked.
+ * Every const char* returned by a legado_* call is UTF-8 and is owned by the
+ * engine: it stays valid until the next call on that thread (or, for
  * legado_sources, until the next legado_sources call). Copy it if you keep it.
  * A NULL answer means the call failed; read legado_last_error.
  *

@@ -28,8 +28,11 @@ legado_close(engine);
 
 ## 线程
 
-一个 handle 同一时间只在一个线程上使用，不需要加锁。`legado_search` /
-`legado_toc` / `legado_content` 会发 HTTP 并执行 JS，不要放在 UI 线程。
+一个 handle 可以从多个线程同时调用，不需要在调用方加锁。JS 上下文、当前书源
+和请求上下文是 thread-local，cookie / HTTP / JS 存储有锁；`legado_search` 的
+返回值和 `legado_last_error` 也按调用线程各存一份。`legado_search` /
+`legado_toc` / `legado_content` 会发 HTTP 并执行 JS，不要放在 UI 线程；多个
+书源可以并发调用同一个 handle。
 
 ## 错误
 

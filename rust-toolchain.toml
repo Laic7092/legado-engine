@@ -1,0 +1,4 @@
+[toolchain]
+# Keep this in step with ebook-engine: the app links both static libraries into
+# one process, and their Rust std copies must come from the same toolchain.
+channel = "1.100.0"

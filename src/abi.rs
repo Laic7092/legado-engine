@@ -2,13 +2,14 @@
 //! the JavaScript runtime; each call fetches, parses and answers, or returns
 //! NULL and sets the handle's last error.
 //!
-//! A handle is used from one thread at a time. Every returned pointer is valid
-//! until the next call on the handle.
+//! A handle can be used from several threads at once; answers and errors are
+//! kept per calling thread. Every returned pointer is valid until the next
+//! call on that thread.
 
+use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use serde::Deserialize;
 
@@ -19,10 +20,17 @@ use crate::pipeline::{Config, Engine};
 
 pub struct LegadoEngine {
     inner: Engine,
-    last_error: Mutex<CString>,
-    /// The last answer, kept alive for the caller to copy. The pointer
-    /// `legado_*` returns points into this string until the next call.
-    result: Mutex<CString>,
+}
+
+// Answers and errors belong to the calling thread. The engine itself is safe
+// to use from several threads at once (its JS contexts are thread-local and
+// its HTTP/session state is locked); this is what lets the app search several
+// sources in parallel on one handle. Each pointer stays valid until the next
+// call on that thread, as before.
+thread_local! {
+    static RESULT: RefCell<CString> = RefCell::new(CString::default());
+    static SOURCES_RESULT: RefCell<CString> = RefCell::new(CString::default());
+    static ERROR: RefCell<CString> = RefCell::new(CString::default());
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -35,10 +43,6 @@ struct OpenConfig {
     direct: bool,
 }
 
-static STATIC_ERROR: Mutex<Option<CString>> = Mutex::new(None);
-static STATIC_RESULT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-static EMPTY: &[u8] = b"\0";
-
 fn text<'a>(p: *const c_char, what: &str) -> anyhow::Result<&'a str> {
     if p.is_null() {
         anyhow::bail!("{what} is NULL");
@@ -48,26 +52,29 @@ fn text<'a>(p: *const c_char, what: &str) -> anyhow::Result<&'a str> {
         .map_err(|_| anyhow::anyhow!("{what} is not UTF-8"))
 }
 
-fn answer(engine: &LegadoEngine, value: String) -> *const c_char {
-    let mut guard = engine.result.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = CString::new(value.replace('\0', "")).unwrap_or_default();
-    guard.as_ptr()
+fn answer(value: String) -> *const c_char {
+    let text = CString::new(value.replace('\0', "")).unwrap_or_default();
+    RESULT.with(|cell| {
+        *cell.borrow_mut() = text;
+        cell.borrow().as_ptr()
+    })
 }
 
 fn static_answer(value: String) -> *const c_char {
-    let mut guard = STATIC_RESULT.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = value.replace('\0', "").into_bytes();
-    guard.push(0);
-    guard.as_ptr() as *const c_char
+    let text = CString::new(value.replace('\0', "")).unwrap_or_default();
+    SOURCES_RESULT.with(|cell| {
+        *cell.borrow_mut() = text;
+        cell.borrow().as_ptr()
+    })
 }
 
 fn source(json: &str) -> anyhow::Result<BookSource> {
     serde_json::from_str(json).map_err(|error| anyhow::anyhow!("source JSON: {error}"))
 }
 
-fn set_error(engine: &LegadoEngine, message: impl std::fmt::Display) {
+fn set_error(message: impl std::fmt::Display) {
     let value = CString::new(message.to_string().replace('\0', "")).unwrap_or_default();
-    *engine.last_error.lock().unwrap_or_else(|e| e.into_inner()) = value;
+    ERROR.with(|cell| *cell.borrow_mut() = value);
 }
 
 fn run_json<T, F>(engine: *mut LegadoEngine, f: F) -> *const c_char
@@ -82,14 +89,14 @@ where
     let result = catch_unwind(AssertUnwindSafe(|| f(engine)));
     match result {
         Ok(Ok(value)) => match serde_json::to_string(&value) {
-            Ok(json) => answer(engine, json),
+            Ok(json) => answer(json),
             Err(error) => {
-                set_error(engine, format!("serialize the result: {error}"));
+                set_error(format!("serialize the result: {error}"));
                 std::ptr::null()
             }
         },
         Ok(Err(error)) => {
-            set_error(engine, format!("{error:#}"));
+            set_error(format!("{error:#}"));
             std::ptr::null()
         }
         Err(panic) => {
@@ -98,7 +105,7 @@ where
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            set_error(engine, format!("engine panic: {message}"));
+            set_error(format!("engine panic: {message}"));
             std::ptr::null()
         }
     }
@@ -114,9 +121,9 @@ where
     let engine = unsafe { &*engine };
     let result = catch_unwind(AssertUnwindSafe(|| f(engine)));
     match result {
-        Ok(Ok(value)) => answer(engine, value),
+        Ok(Ok(value)) => answer(value),
         Ok(Err(error)) => {
-            set_error(engine, format!("{error:#}"));
+            set_error(format!("{error:#}"));
             std::ptr::null()
         }
         Err(panic) => {
@@ -125,7 +132,7 @@ where
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            set_error(engine, format!("engine panic: {message}"));
+            set_error(format!("engine panic: {message}"));
             std::ptr::null()
         }
     }
@@ -133,7 +140,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn legado_version() -> *const c_char {
-    static VERSION: &[u8] = b"legado-engine 0.1.0\0";
+    static VERSION: &[u8] = b"legado-engine 0.2.0\0";
     VERSION.as_ptr() as *const c_char
 }
 
@@ -161,19 +168,13 @@ pub extern "C" fn legado_open(config_json: *const c_char) -> *mut LegadoEngine {
         Engine::new(config).map_err(|error| format!("{error:#}"))
     }));
     match parsed {
-        Ok(Ok(inner)) => Box::into_raw(Box::new(LegadoEngine {
-            inner,
-            last_error: Mutex::new(CString::default()),
-            result: Mutex::new(CString::default()),
-        })),
+        Ok(Ok(inner)) => Box::into_raw(Box::new(LegadoEngine { inner })),
         Ok(Err(error)) => {
-            *STATIC_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(CString::new(error.replace('\0', "")).unwrap_or_default());
+            set_error(error);
             std::ptr::null_mut()
         }
         Err(_) => {
-            *STATIC_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(CString::new("panic while opening the engine").unwrap_or_default());
+            set_error("panic while opening the engine");
             std::ptr::null_mut()
         }
     }
@@ -261,33 +262,19 @@ pub extern "C" fn legado_sources(json: *const c_char) -> *const c_char {
             static_answer(serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string()))
         }
         Ok(Err(error)) => {
-            *STATIC_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(CString::new(error.to_string().replace('\0', "")).unwrap_or_default());
+            set_error(error);
             std::ptr::null()
         }
         Err(_) => {
-            *STATIC_ERROR.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(CString::new("panic while parsing sources").unwrap_or_default());
+            set_error("panic while parsing sources");
             std::ptr::null()
         }
     }
 }
 
 #[no_mangle]
-pub extern "C" fn legado_last_error(engine: *const LegadoEngine) -> *const c_char {
-    if engine.is_null() {
-        let guard = STATIC_ERROR.lock().unwrap_or_else(|e| e.into_inner());
-        return guard
-            .as_ref()
-            .map(|value| value.as_ptr())
-            .unwrap_or(EMPTY.as_ptr() as *const c_char);
-    }
-    let engine = unsafe { &*engine };
-    engine
-        .last_error
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ptr()
+pub extern "C" fn legado_last_error(_engine: *const LegadoEngine) -> *const c_char {
+    ERROR.with(|cell| cell.borrow().as_ptr())
 }
 
 #[no_mangle]
