@@ -28,12 +28,8 @@ jobs:
           - target: aarch64-apple-ios
             os: macos-latest
             artifact: ios-arm64
-          - target: aarch64-apple-ios-sim
-            os: macos-latest
-            artifact: ios-simulator-arm64
-          - target: x86_64-apple-ios
-            os: macos-latest
-            artifact: ios-simulator-x64
+          # 只发真机切片：rquickjs-sys 的 bindgen 不认 `-ios-sim` triple，
+          # 模拟器需要额外 vendor 补丁，暂不发布。
           # Windows 用 runner 自带的 MSVC：不需要 MSYS2/MinGW 和 CC 覆盖。
           - target: x86_64-pc-windows-msvc
             os: windows-latest
