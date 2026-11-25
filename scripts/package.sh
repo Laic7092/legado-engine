@@ -9,7 +9,15 @@ artifact="${2:-$target}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-cargo build --locked --release --target "$target" --lib
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+if ! cargo build --locked --release --target "$target" --lib >"$log" 2>&1; then
+  cat "$log"
+  # 把错误尾行变成 GitHub annotation，公开仓库也能在 API 里看到失败原因。
+  msg="$(tail -n 80 "$log" | sed 's/%/%25/g; s/\r$//' | awk 'BEGIN { ORS = "%0A" } { print }')"
+  echo "::error title=cargo build ($target)::$msg"
+  exit 1
+fi
 
 lib="target/$target/release/liblegado_engine.a"
 if [[ ! -f "$lib" ]]; then

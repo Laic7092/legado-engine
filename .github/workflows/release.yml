@@ -52,6 +52,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # rquickjs-sys 在 iOS 上没有预生成 bindings，bindgen 需要 Xcode 里的 libclang。
+      - name: Point bindgen at Xcode libclang
+        if: contains(matrix.target, 'ios')
+        shell: bash
+        run: echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+
       - name: Build and pack
         shell: bash
         run: scripts/package.sh "${{ matrix.target }}" "${{ matrix.artifact }}"

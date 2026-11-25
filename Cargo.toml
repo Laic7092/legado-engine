@@ -56,3 +56,7 @@ thiserror = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+
+# rquickjs-sys 0.7 没有随包提供 iOS 的 bindings，iOS 上让 bindgen 现场生成。
+[target.'cfg(target_os = "ios")'.dependencies]
+rquickjs = { version = "0.7", features = ["futures", "bindgen"] }
