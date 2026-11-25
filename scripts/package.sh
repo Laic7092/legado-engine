@@ -9,7 +9,7 @@ artifact="${2:-$target}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-cargo build --release --target "$target" --lib
+cargo build --locked --release --target "$target" --lib
 
 lib="target/$target/release/liblegado_engine.a"
 if [[ ! -f "$lib" ]]; then
