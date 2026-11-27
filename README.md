@@ -31,6 +31,7 @@ make test-c   # 用 C 程序调用 open / version / close
 | --- | --- |
 | 生命周期 | `legado_open`、`legado_close`、`legado_version` |
 | 书源 | `legado_search`、`legado_explore`、`legado_info`、`legado_toc`、`legado_content` |
+| 下载 | `legado_download`（用书源的 header/cookie/代理把文件写到 `dest_path`） |
 | 会话 | `legado_cookie_header`、`legado_set_cookie` |
 | 调试 | `legado_eval`、`legado_eval_rule` |
 | 元数据 | `legado_sources` |
@@ -72,7 +73,12 @@ JS，调用方应放在工作线程；多个书源搜索可以直接并发调用
   等环境变量。需要时用 `config.proxy` 指定。
 - 按 Legado 的行为，TLS 不校验证书和主机名。
 - `java.startBrowser*` / `webView` 未实现；登录后的 Cookie 用
-  `legado_set_cookie` 注入。
+  `legado_set_cookie` 注入，或在书源的 `jsLib` 里用 `java.post` 登录（见
+  `sources/wenku8.json`）。两种方式的 Cookie 都会与规则请求共用
+  `config.userNs` 下的同一个 jar。
+- 下载型书源（`bookSourceType` 3）没有章节：`legado_info` 的 `downloadUrls`
+  每行是 `名称::URL`（或裸 URL），交给 `legado_download` 落盘；`charset` 由
+  引擎按响应头、BOM、UTF-8 合法性、GB18030 依次嗅探。文本型源（`bookSourceType` 0）也可以带 `downloadUrls`，同时支持在线阅读和下载。
 - `exploreUrl` 的分类 JSON 由调用方解析；`legado_explore` 处理单个分类 URL。
 - 只在 Linux 上本地验证，其他目标由 CI 构建。
 
@@ -87,6 +93,7 @@ JS，调用方应放在工作线程；多个书源搜索可以直接并发调用
 | `src/abi.rs` | C ABI |
 | `src/service/` | 浏览器登录接口（未实现） |
 | `examples/`、`tests/` | 示例与测试 |
+| `sources/` | 可直接导入的示例书源：`wenku8.json`（在线，需登录）、`zxcs.json`（文件型） |
 
 ## 文档
 

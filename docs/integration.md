@@ -117,10 +117,39 @@ worker Legado {
 }
 ```
 
+## 下载
+
+文件型书源（如知轩藏书，`bookSourceType: 3`）没有章节，把下载链接放在
+`ruleBookInfo.downloadUrls` 里，每行一条：
+
+```
+TXT::https://download.example/books/1.txt
+EPUB::https://download.example/books/1.epub
+```
+
+裸 URL 也可以（名称由宿主决定）。然后：
+
+```c
+const char *done = legado_download(engine, source_json, url, "/tmp/book.txt");
+/* {"path":"/tmp/book.txt","size":7172215,"contentType":"text/plain",
+ *  "charset":"gb18030","url":"…"} */
+```
+
+- 父目录会自动创建，写入先落到 `dest.part` 再 rename，失败不会留下半截文件。
+- 用书源的 header / cookie / 代理请求，能过和详情页同一层反爬（Cloudflare、
+  按 UA 投毒等）。
+- 字节原样落盘；`charset` 依次看响应头、BOM、UTF-8 合法性，最后回退
+  `gb18030`（中文 TXT 常见）。
+
 ## 登录
 
-`java.startBrowser*` / `webView` 未实现。需要在 WebView 完成登录，再把 Cookie
-注入引擎：
+两条路：
+
+1. **书源自己登**（纯 HTTP，无 WebView）：在 `jsLib` 里用 `java.post` 提交登录表单，
+   把账号密码放在书源变量（`source.put`）里。登录拿到的 Cookie 与
+   `search/info/toc/content` 共用同一个 per-source cookie jar。示例见
+   [`sources/wenku8.json`](../sources/wenku8.json)。
+2. **宿主注入**：需要在 WebView 完成登录（验证码、扫码等）时，把 Cookie 交给引擎：
 
 ```asuka
 legado_set_cookie(engine, sourceJson, sourceUrl, cookieHeaderFromWebView)

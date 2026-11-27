@@ -16,5 +16,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib
       - run: cargo test --test online
+      - run: cargo test --test download
       - run: cargo build --release --lib
       - run: make test-c

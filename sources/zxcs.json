@@ -1,0 +1,37 @@
+{
+  "bookSourceName": "知轩藏书",
+  "bookSourceGroup": "下载站, TXT",
+  "bookSourceUrl": "https://zxcs.zip",
+  "bookSourceType": 3,
+  "enabled": true,
+  "enabledExplore": true,
+  "customOrder": 0,
+  "bookSourceComment": "文件型书源：没有章节，legado_info 的 downloadUrls 是 TXT 直链（每行 名称::URL）。用 legado_download 落盘。站点按 UA 反爬，非浏览器 UA 会拿到诱饵页；引擎默认 Chrome UA 不受影响。",
+  "searchUrl": "/search?q={{key}}&page={{page}}",
+  "exploreUrl": "[{\"title\":\"下载榜\",\"url\":\"/rank/topdownload?page={{page}}\"},{\"title\":\"仙草榜\",\"url\":\"/rank/toppraise?page={{page}}\"},{\"title\":\"书荒推书\",\"url\":\"/recommend?page={{page}}\"},{\"title\":\"玄幻魔法\",\"url\":\"/category/玄幻魔法?page={{page}}\"},{\"title\":\"武侠\",\"url\":\"/category/武侠?page={{page}}\"},{\"title\":\"仙侠\",\"url\":\"/category/仙侠?page={{page}}\"},{\"title\":\"都市\",\"url\":\"/category/都市?page={{page}}\"},{\"title\":\"历史\",\"url\":\"/category/历史?page={{page}}\"},{\"title\":\"科幻\",\"url\":\"/category/科幻?page={{page}}\"},{\"title\":\"灵异\",\"url\":\"/category/灵异?page={{page}}\"}]",
+  "ruleSearch": {
+    "bookList": "mio-tile",
+    "name": "h3 span@text##^《|》（[^）]*）作者.*",
+    "author": "h3 span@text##.*作者[：:]\\s*",
+    "bookUrl": "a@href",
+    "intro": ".tile-description@text",
+    "updateTime": "time@datetime"
+  },
+  "ruleBookInfo": {
+    "name": "h2 a@text##^《|》（[^）]*）作者.*",
+    "author": "@js:(result.match(/【作者】[：:]\\s*([\\s\\S]*?)<\\/p>/)||[])[1]",
+    "intro": "@js:((result.match(/【内容简介】[：:][\\s\\S]*?<br\\s*\\/?>([\\s\\S]*?)<\\/p>/)||[])[1]||'').replace(/<[^>]+>/g,'').trim()",
+    "kind": "@js:(result.match(/【分类】[：:][\\s\\S]*?<a[^>]*>([\\s\\S]*?)<\\/a>/)||[])[1]",
+    "wordCount": "@js:(result.match(/【字数】[：:]\\s*(\\d+)/)||[])[1]",
+    "coverUrl": "img[src*='/images/cover/']@src",
+    "downloadUrls": "@js:var m=result.match(/href=\"(https?:\\/\\/download\\.zxcs\\.zip\\/[^\"]+)\"/);m?('TXT::'+m[1]):''"
+  },
+  "ruleToc": {
+    "chapterList": "",
+    "chapterName": "",
+    "chapterUrl": ""
+  },
+  "ruleContent": {
+    "content": ""
+  }
+}

@@ -3,11 +3,12 @@
 //! engine and the JavaScript runtime.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use encoding_rs::Encoding;
 
-use crate::crawler::fetcher::{fetch_with_client, FetchResponse, RequestSpec};
+use crate::crawler::fetcher::{fetch_bytes_with_client, fetch_with_client, FetchResponse, RequestSpec};
 use crate::crawler::http_client::HttpClient;
 use crate::crawler::url_analyzer::analyze_url;
 use crate::model::book::Book;
@@ -37,10 +38,31 @@ pub struct Engine {
     direct: bool,
 }
 
+/// A file downloaded through a source's client: the bytes land in `path`, and
+/// `charset` says how to read them back (`utf-8`, `gb18030`, …).
+///
+/// Download-type sources (知轩藏书, 轻小说文库的 TXT) have no chapters to speak
+/// of: the useful artefact is the file itself.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Download {
+    pub path: String,
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub charset: String,
+    /// The final URL after redirects.
+    pub url: String,
+}
+
 impl Engine {
     pub fn new(config: Config) -> Result<Self> {
         let timeout = config.timeout_secs.unwrap_or(30).max(1);
         let http = HttpClient::new(timeout, config.proxy.clone())?;
+        let user_ns = config
+            .user_ns
+            .clone()
+            .unwrap_or_else(|| "legado-engine".to_string());
+        http.set_user_ns(&user_ns);
         if let Some(dir) = config.storage_dir.as_ref() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("create storage dir {}", dir.display()))?;
@@ -59,9 +81,7 @@ impl Engine {
             http,
             rt,
             rules: RuleEngine::new()?,
-            user_ns: config
-                .user_ns
-                .unwrap_or_else(|| "legado-engine".to_string()),
+            user_ns,
             direct: config.direct,
         })
     }
@@ -274,6 +294,46 @@ impl Engine {
         Ok((body, response.url))
     }
 
+    /// Download a file and write it to `dest`.
+    ///
+    /// Uses the source's headers, cookies and proxy, so a Cloudflare-fronted
+    /// file host sees the same client as the pages that linked to it. The
+    /// charset is sniffed from the response (declared charset, BOM, valid
+    /// UTF-8, else GB18030) instead of trusting a decoded string, because the
+    /// download itself must stay byte-exact.
+    pub fn download(&self, source: &BookSource, url: &str, dest: &Path) -> Result<Download> {
+        let spec = self.spec(source, url, "", 1)?;
+        let context = self.context(source, spec.proxy.as_deref())?;
+        let response = self
+            .rt
+            .block_on(fetch_bytes_with_client(&context.client, spec))
+            .context("download the source file")?;
+        if response.status >= 400 {
+            return Err(anyhow!(
+                "the source answered {} for {}",
+                response.status,
+                response.url
+            ));
+        }
+        let bytes = response.raw_body;
+        if bytes.is_empty() {
+            return Err(anyhow!("the source sent an empty file for {}", response.url));
+        }
+        let charset = detect_charset(&bytes, response.content_type.as_deref());
+        if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        write_atomically(dest, &bytes)?;
+        Ok(Download {
+            path: dest.to_string_lossy().into_owned(),
+            size: bytes.len() as u64,
+            content_type: response.content_type,
+            charset,
+            url: response.url,
+        })
+    }
+
     /// The source's `Cookie` header for a URL.
     pub fn cookie_header(&self, source: &BookSource, url: &str) -> Result<String> {
         let url = url::Url::parse(url).context("parse the cookie url")?;
@@ -302,4 +362,53 @@ impl Engine {
                 .source_context(&self.user_ns, &source.book_source_url, proxy)
         }
     }
+}
+
+/// Sniff a downloaded file's charset without decoding it.
+///
+/// Order: declared charset, BOM, valid UTF-8, else GB18030. Chinese TXT
+/// downloads have no `Content-Type: charset` and are usually GBK/GB18030;
+/// treating them as UTF-8 lossy would replace every other character with U+FFFD.
+fn detect_charset(bytes: &[u8], content_type: Option<&str>) -> String {
+    if let Some(label) = content_type.and_then(declared_charset) {
+        if let Some(encoding) = Encoding::for_label(label.trim().as_bytes()) {
+            return encoding.name().to_ascii_lowercase();
+        }
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return "utf-8".to_string();
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return "utf-16le".to_string();
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return "utf-16be".to_string();
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return "utf-8".to_string();
+    }
+    "gb18030".to_string()
+}
+
+fn declared_charset(content_type: &str) -> Option<&str> {
+    content_type.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("charset").then(|| value.trim())
+    })
+}
+
+/// Write through a sibling `.part` file so a failed download never leaves a
+/// truncated file where the host expects a complete one.
+fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temp = dest.as_os_str().to_os_string();
+    temp.push(".part");
+    let temp = PathBuf::from(temp);
+    if let Err(error) = std::fs::write(&temp, bytes) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).with_context(|| format!("write {}", temp.display()));
+    }
+    std::fs::rename(&temp, dest).with_context(|| {
+        let _ = std::fs::remove_file(&temp);
+        format!("move {} to {}", temp.display(), dest.display())
+    })
 }

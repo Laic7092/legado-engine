@@ -25,6 +25,10 @@ pub struct HttpClient {
     source_sessions: Arc<RwLock<HashMap<String, Arc<SourceSession>>>>,
     source_clients: Arc<RwLock<HashMap<String, Client>>>,
     source_storage_dir: Arc<RwLock<Option<PathBuf>>>,
+    /// Namespace for per-source sessions. The JS bindings (`java.ajax`, login
+    /// from jsLib) and the rule pipeline must share it, otherwise a login done
+    /// in a script lands in a different cookie jar than search/info fetches.
+    user_ns: Arc<RwLock<String>>,
 }
 
 impl HttpClient {
@@ -41,6 +45,7 @@ impl HttpClient {
             source_sessions: Arc::default(),
             source_clients: Arc::default(),
             source_storage_dir: Arc::default(),
+            user_ns: Arc::new(RwLock::new("legado-engine".to_string())),
         })
     }
 
@@ -48,6 +53,22 @@ impl HttpClient {
         self.client
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn set_user_ns(&self, namespace: &str) {
+        let namespace = namespace.trim();
+        *self.user_ns.write().unwrap_or_else(|e| e.into_inner()) = if namespace.is_empty() {
+            "legado-engine".to_string()
+        } else {
+            namespace.to_string()
+        };
+    }
+
+    pub fn user_ns(&self) -> String {
+        self.user_ns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 

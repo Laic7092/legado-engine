@@ -1,6 +1,6 @@
 [package]
 name = "legado-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Legado (阅读3.0) book-source rules and JavaScript, behind a C ABI"

@@ -1,0 +1,48 @@
+{
+  "bookSourceName": "轻小说文库 (wenku8)",
+  "bookSourceGroup": "轻小说, 在线, 需登录",
+  "bookSourceUrl": "https://www.wenku8.net",
+  "bookSourceType": 0,
+  "enabled": true,
+  "enabledExplore": true,
+  "customOrder": 0,
+  "bookSourceComment": "搜索/分类需要登录。先在书源变量里设置 wenku8_user / wenku8_pass（legado_eval 执行 source.put('wenku8_user','…') 与 source.put('wenku8_pass','…') 即可，storageDir 会持久化）；详情/目录/正文免登录；TXT 下载（GBK/UTF-8）也不需要登录，同一本书源既能在阅读也在详情页下载。站点在 Cloudflare 后面，header 里的 Sec-Fetch-* 是过挑战的关键。",
+  "header": "{\"Sec-Fetch-Site\":\"none\"}",
+  "loginUrl": "https://www.wenku8.net/login.php",
+  "jsLib": "var WENKU8 = (function () {\n  var BASE = 'https://www.wenku8.net';\n  function cookieOf(name) {\n    var all = cookie.getCookie(BASE + '/');\n    var m = all.match(new RegExp('(?:^|;\\\\s*)' + name + '=([^;]*)'));\n    return m ? m[1] : '';\n  }\n  function credentials() {\n    var user = source.get('wenku8_user');\n    var pass = source.get('wenku8_pass');\n    if (!user || !pass) {\n      var raw = source.getVariable();\n      if (raw) {\n        try {\n          var v = JSON.parse(raw);\n          user = user || v.user || v.username || '';\n          pass = pass || v.pass || v.password || '';\n        } catch (e) {}\n      }\n    }\n    return { user: user, pass: pass };\n  }\n  function loggedIn() {\n    return !!(cookieOf('jieqiUserInfo') || cookieOf('jieqiUserName'));\n  }\n  function login() {\n    if (loggedIn()) return true;\n    var c = credentials();\n    if (!c.user || !c.pass) {\n      throw new Error('轻小说文库需要登录：先设置书源变量 wenku8_user / wenku8_pass');\n    }\n    var body = 'username=' + encodeURIComponent(c.user) +\n      '&password=' + encodeURIComponent(c.pass) +\n      '&usecookie=315360000&action=login&submit=' + encodeURIComponent('登录');\n    var resp = java.post(BASE + '/login.php?do=submit', body, {\n      'Referer': BASE + '/login.php',\n      'Content-Type': 'application/x-www-form-urlencoded'\n    });\n    if (!loggedIn()) {\n      throw new Error('轻小说文库登录失败（HTTP ' + resp.code + '）：检查 wenku8_user / wenku8_pass');\n    }\n    return true;\n  }\n  return { login: login, loggedIn: loggedIn };\n})();",
+  "searchUrl": "<js>WENKU8.login();'/modules/article/search.php?searchtype=articlename&searchkey='+java.encodeURI(key,'GBK')+'&page='+page</js>",
+  "exploreUrl": "[{\"title\":\"轻小说列表\",\"url\":\"<js>WENKU8.login();'/modules/article/articlelist.php?page='+page</js>\"},{\"title\":\"完结全本\",\"url\":\"<js>WENKU8.login();'/modules/article/articlelist.php?fullflag=1&page='+page</js>\"},{\"title\":\"热门\",\"url\":\"<js>WENKU8.login();'/modules/article/toplist.php?sort=allvisit&page='+page</js>\"},{\"title\":\"动画化\",\"url\":\"<js>WENKU8.login();'/modules/article/toplist.php?sort=anime&page='+page</js>\"},{\"title\":\"今日更新\",\"url\":\"<js>WENKU8.login();'/modules/article/toplist.php?sort=lastupdate&page='+page</js>\"},{\"title\":\"新书一览\",\"url\":\"<js>WENKU8.login();'/modules/article/toplist.php?sort=postdate&page='+page</js>\"}]",
+  "ruleSearch": {
+    "bookList": "<js>(function(){var chunks=String(result).split(/<div style=\"width:373px/);var out=[];for(var i=1;i<chunks.length;i++){var c=chunks[i];var u=(c.match(/<b><a[^>]+href=\"([^\"]+)\"/i)||[])[1];var n=(c.match(/<b><a[^>]+title=\"([^\"]+)\"/i)||[])[1]||(c.match(/<b><a[^>]*>([\\s\\S]*?)<\\/a><\\/b>/i)||[])[1];if(!u||!n)continue;var meta=(c.match(/作者[:：]([\\s\\S]*?)<\\/p>/i)||[])[1]||'';var author=(meta.split('/')[0]||'').trim();var kind=(meta.match(/分类[:：]\\s*([^\\/]*)/i)||[])[1]||'';var upd=(c.match(/更新[:：]\\s*([\\d-]+)/i)||[])[1]||'';var words=(c.match(/字数[:：]\\s*([^\\/<]*)/i)||[])[1]||'';var intro=(c.match(/简介[:：]([\\s\\S]*?)<\\/p>/i)||[])[1]||'';var cover=(c.match(/<img[^>]+src=\"([^\"]+)\"/i)||[])[1]||'';out.push('<div class=\"item\"><a class=\"name\" href=\"'+u+'\">'+n+'</a>'+'<span class=\"author\">'+author+'</span>'+'<span class=\"kind\">'+kind.trim()+'</span>'+'<span class=\"words\">'+words.trim()+'</span>'+'<span class=\"time\">'+upd+'</span>'+'<span class=\"intro\">'+intro.trim()+'</span>'+'<img class=\"cover\" src=\"'+cover+'\"/></div>');}return out.join('');})()</js>",
+    "name": "a.name@text",
+    "author": "span.author@text",
+    "bookUrl": "a.name@href",
+    "kind": "span.kind@text",
+    "wordCount": "span.words@text",
+    "updateTime": "span.time@text",
+    "intro": "span.intro@text",
+    "coverUrl": "img.cover@src"
+  },
+  "ruleBookInfo": {
+    "name": "#content b@text",
+    "author": "((result.match(/小说作者[：:]\\s*([\\s\\S]*?)<\\/td>/)||[])[1]||'').trim()",
+    "kind": "((result.match(/文库分类[：:]\\s*([\\s\\S]*?)<\\/td>/)||[])[1]||'').trim()",
+    "intro": "@js:(result.match(/内容简介[：:]<\\/span>[\\s\\S]*?<span[^>]*>([\\s\\S]*?)<\\/span>/)||[])[1]",
+    "lastChapter": "@js:(result.match(/最近章节[：:][\\s\\S]*?<a[^>]*>([\\s\\S]*?)<\\/a>/)||[])[1]",
+    "updateTime": "@js:(result.match(/最后更新[：:]\\s*([\\d-]+)/)||[])[1]",
+    "wordCount": "@js:(result.match(/全文长度[：:]\\s*(\\d+)/)||[])[1]",
+    "coverUrl": "#content img@src",
+    "tocUrl": "@js:var m=result.match(/\\/novel\\/(\\d+)\\/(\\d+)\\/\\d+\\.htm/);m?('/novel/'+m[1]+'/'+m[2]+'/index.htm'):''",
+    "downloadUrls": "@js:(function(){var m=String(baseUrl).match(/\\/book\\/(\\d+)\\.htm/);if(!m)return '';var id=m[1];return '简体(G)::https://dl.wenku8.com/down.php?type=txt&node=1&id='+id+'\\n'+'简体(U)::https://dl.wenku8.com/down.php?type=utf8&node=1&id='+id;})()"
+  },
+  "ruleToc": {
+    "chapterList": "table.css td.ccss",
+    "chapterName": "@text",
+    "chapterUrl": "a@href",
+    "nextTocUrl": "//a[contains(text(),'下一页')]@href"
+  },
+  "ruleContent": {
+    "content": "#content@html",
+    "replaceRegex": "<ul id=\"contentdp\"[\\s\\S]*?</ul>|<script[\\s\\S]*?</script>"
+  }
+}

@@ -200,7 +200,9 @@ pub fn source_http_context(source_url: &str) -> anyhow::Result<SourceHttpContext
     if let Some(http) = ACTIVE_HTTP.with(|cell| cell.borrow().clone()) {
         if http.session.source_url == source_url.trim() { return Ok(http); }
     }
-    JS_DEFAULT_HTTP.get().unwrap_or(&JS_FALLBACK_HTTP).source_context("default", source_url, None)
+    let http = JS_DEFAULT_HTTP.get().unwrap_or(&JS_FALLBACK_HTTP);
+    let namespace = http.user_ns();
+    http.source_context(&namespace, source_url, None)
 }
 
 pub fn take_login_effects() -> LoginEffects {

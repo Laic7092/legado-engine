@@ -174,6 +174,18 @@ pub async fn fetch_raw_with_client(
     fetch_inner(request_client, req, true).await
 }
 
+/// 下载用请求: `Content-Encoding` 交给 reqwest 正常解压, 但**不做字符集解码**,
+/// 因此 `raw_body` 是站点真正发出的文件字节(可能是 GBK 的 TXT、EPUB、ZIP)。
+///
+/// 与 [`fetch_raw_with_client`] 的区别只在调用方传入的客户端: 这里用书源的
+/// 普通客户端(开启了 gzip/br/deflate)。
+pub(crate) async fn fetch_bytes_with_client(
+    request_client: &reqwest::Client,
+    req: RequestSpec,
+) -> anyhow::Result<FetchResponse> {
+    fetch_inner(request_client, req, true).await
+}
+
 async fn fetch_inner(
     request_client: &reqwest::Client,
     req: RequestSpec,
@@ -200,6 +212,7 @@ async fn fetch_inner(
         }
 
         let mut has_content_type = false;
+        let mut injected_host = false;
         // 显式把 `Host` 放在第一个首部。
         //
         // Cloudflare 的托管挑战会按首部写法识别客户端: 同一请求把 `Host` 放在
@@ -214,6 +227,7 @@ async fn fetch_inner(
                 .any(|(k, _)| k.eq_ignore_ascii_case("host"));
             if !already {
                 builder = builder.header(reqwest::header::HOST, host);
+                injected_host = true;
             }
         }
         for (k, v) in &req.headers {
@@ -267,6 +281,40 @@ async fn fetch_inner(
                     retry = retry.body(body);
                 }
                 retry.send().await.or(Err(err))
+            }
+            other => other,
+        };
+        // 跨域跳转（CDN 下载最常见：`dl.example.com` → `dl1.example.com`）会
+        // 让显式的 `Host` 跟到新域，目标服务器按 Host 拒绝（实测轻小说文库的
+        // TXT 下载回 403）。响应还没读 body，丢掉重发一次即可；只在失败时重发，
+        // 所以成功路径不会多一次请求。
+        let sent = match sent {
+            Ok(res)
+                if injected_host
+                    && !res.status().is_success()
+                    && url_host(&req.url) != res.url().host_str().map(str::to_ascii_lowercase) =>
+            {
+                drop(res);
+                let mut retry = match req.method {
+                    HttpMethod::GET => request_client.get(&req.url),
+                    HttpMethod::POST => request_client.post(&req.url),
+                    HttpMethod::HEAD => request_client.head(&req.url),
+                    HttpMethod::PUT => request_client.put(&req.url),
+                    HttpMethod::PATCH => request_client.patch(&req.url),
+                    HttpMethod::DELETE => request_client.delete(&req.url),
+                };
+                for (k, v) in &req.headers {
+                    retry = retry.header(k, v);
+                }
+                if let Some(timeout) = req.timeout {
+                    retry = retry.timeout(timeout);
+                }
+                if let Some(bytes) = req.body_bytes.clone() {
+                    retry = retry.body(bytes);
+                } else if let Some(body) = req.body.clone() {
+                    retry = retry.body(body);
+                }
+                retry.send().await
             }
             other => other,
         };
@@ -354,6 +402,12 @@ async fn fetch_inner(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("fetch failed")))
+}
+
+fn url_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
 }
 
 pub(crate) fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {

@@ -140,7 +140,7 @@ where
 
 #[no_mangle]
 pub extern "C" fn legado_version() -> *const c_char {
-    static VERSION: &[u8] = b"legado-engine 0.2.0\0";
+    static VERSION: &[u8] = b"legado-engine 0.3.0\0";
     VERSION.as_ptr() as *const c_char
 }
 
@@ -345,6 +345,32 @@ pub extern "C" fn legado_content(
         let chapter: BookChapter = serde_json::from_str(text(chapter_json, "chapter_json")?)
             .map_err(|error| anyhow::anyhow!("chapter JSON: {error}"))?;
         engine.inner.content(&source, &book, &chapter)
+    })
+}
+
+/// Download a file with the source's headers, cookies and proxy, and write it
+/// to `dest_path`. Answers
+/// `{"path":"…","size":123,"contentType":null,"charset":"gb18030","url":"…"}`.
+///
+/// `charset` is sniffed from the file itself (declared charset, BOM, UTF-8,
+/// else GB18030); the bytes are written verbatim.
+#[no_mangle]
+pub extern "C" fn legado_download(
+    engine: *mut LegadoEngine,
+    source_json: *const c_char,
+    url: *const c_char,
+    dest_path: *const c_char,
+) -> *const c_char {
+    run_json(engine, |engine| {
+        let source = source(text(source_json, "source_json")?)?;
+        let url = text(url, "url")?;
+        let dest = text(dest_path, "dest_path")?;
+        if dest.trim().is_empty() {
+            anyhow::bail!("dest_path is empty");
+        }
+        Ok(engine
+            .inner
+            .download(&source, url, std::path::Path::new(dest))?)
     })
 }
 
