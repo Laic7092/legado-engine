@@ -72,7 +72,11 @@ impl BookSource {
             .and_then(|rule| rule.check_key_word.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .filter(|value| !["http", "::", "++", "--"].iter().any(|token| value.contains(token)))
+            .filter(|value| {
+                !["http", "::", "++", "--"]
+                    .iter()
+                    .any(|token| value.contains(token))
+            })
             .unwrap_or(DEFAULT_CHECK_KEYWORD)
             .to_string()
     }
@@ -85,9 +89,7 @@ pub const DEFAULT_CHECK_KEYWORD: &str = "我的";
 ///
 /// 它不只是"一个分类链接"：`type` 决定渲染成什么控件，`action` 是该控件的
 /// 点击脚本，`chars`/`default` 是 select 与 toggle 的选项与初值。聚合类书源的
-/// 发现页筛选栏、搜索框、刷新按钮全靠这几个字段 ——
-/// 早先只保留 `title/url/style` 时它们会在反序列化阶段被静默丢弃，前端因而
-/// 只能把每个控件都渲染成一个普通分类按钮。
+/// 发现页筛选栏、搜索框、刷新按钮全靠这几个字段。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ExploreKind {
@@ -197,12 +199,16 @@ where
     }
 }
 
-fn deserialize_login_ui<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+fn deserialize_login_ui<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
     match Option::<Value>::deserialize(deserializer)? {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text)),
         Some(value @ Value::Array(_)) => Ok(Some(value.to_string())),
-        Some(_) => Err(serde::de::Error::custom("loginUi must be a string or an array")),
+        Some(_) => Err(serde::de::Error::custom(
+            "loginUi must be a string or an array",
+        )),
     }
 }
 
@@ -257,7 +263,9 @@ fn normalize_string_fields(obj: &mut serde_json::Map<String, Value>) {
         "httpUserAgent",
     ];
     for field in STRING_FIELDS {
-        let Some(value) = obj.get(*field) else { continue };
+        let Some(value) = obj.get(*field) else {
+            continue;
+        };
         let normalized = match value {
             // 与 legado `StringJsonDeserializer` 一致：非标量一律 `toString()`
             // （紧凑 JSON）。
@@ -286,7 +294,10 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
     move_if_absent(obj, "serialNumber", "customOrder");
     // Only URLs originating in the old schema need syntax migration. Modern
     // fields can contain arbitrary JS/JSON; rewriting braces corrupts them.
-    for (old, new) in [("ruleFindUrl", "exploreUrl"), ("ruleSearchUrl", "searchUrl")] {
+    for (old, new) in [
+        ("ruleFindUrl", "exploreUrl"),
+        ("ruleSearchUrl", "searchUrl"),
+    ] {
         if !obj.contains_key(new) {
             if let Some(raw) = obj.remove(old) {
                 let converted = match raw {
@@ -420,7 +431,11 @@ fn migrate_rule_object(obj: &mut Map<String, Value>, target: &str, fields: &[(&s
         if target_obj.contains_key(*new) {
             continue;
         }
-        if let Some(value) = obj.remove(*old) {
+        // 老键名有两个位置：规则对象**里面**（2.x：`ruleSearch.ruleSearchList`）
+        // 和书源顶层（更早的扁平写法）。嵌套的位置更具体，先取它；只找顶层会让
+        // 2.x 的源导入后规则全空。
+        let value = target_obj.remove(*old).or_else(|| obj.remove(*old));
+        if let Some(value) = value {
             if !value.as_str().map(str::trim).unwrap_or("x").is_empty() {
                 target_obj.insert((*new).to_string(), value);
             }
@@ -611,5 +626,84 @@ mod check_keyword_tests {
             ..Default::default()
         };
         assert_eq!(source.check_keyword(), "我的");
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 2.x 把老键名放在规则对象**里面**：`ruleSearch.ruleSearchList`。
+    /// 只认顶层的老迁移代码会把它们整条丢掉（源能导入，搜索/目录/正文全空）。
+    #[test]
+    fn nested_legacy_keys_move_into_the_rule_object() {
+        let source = book_source_from_value(json!({
+            "bookSourceName": "旧版",
+            "bookSourceUrl": "https://old.test",
+            "ruleSearch": {
+                "ruleSearchList": "div.book",
+                "ruleSearchName": "a.name@text",
+                "ruleSearchAuthor": "span.au@text",
+                "ruleSearchBookUrl": "a@href"
+            },
+            "ruleToc": { "ruleChapterList": "#list a", "ruleChapterName": "text" },
+            "ruleContent": { "ruleBookContent": "#content@html" }
+        }))
+        .unwrap();
+
+        let search = source.rule_search.unwrap();
+        assert_eq!(search.book_list.as_deref(), Some("div.book"));
+        assert_eq!(search.name.as_deref(), Some("a.name@text"));
+        assert_eq!(search.author.as_deref(), Some("span.au@text"));
+        assert_eq!(search.book_url.as_deref(), Some("a@href"));
+
+        let toc = source.rule_toc.unwrap();
+        assert_eq!(toc.chapter_list.as_deref(), Some("#list a"));
+        assert_eq!(toc.chapter_name.as_deref(), Some("text"));
+
+        let content = source.rule_content.unwrap();
+        assert_eq!(content.content.as_deref(), Some("#content@html"));
+    }
+
+    #[test]
+    fn modern_keys_win_over_legacy_ones() {
+        let source = book_source_from_value(json!({
+            "bookSourceUrl": "https://x.test",
+            "ruleSearch": { "bookList": "new", "ruleSearchList": "old" }
+        }))
+        .unwrap();
+        assert_eq!(
+            source.rule_search.unwrap().book_list.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn top_level_legacy_keys_still_move() {
+        let source = book_source_from_value(json!({
+            "bookSourceUrl": "https://x.test",
+            "ruleChapterList": "#list a",
+            "ruleBookContent": "#content"
+        }))
+        .unwrap();
+        assert_eq!(
+            source.rule_toc.unwrap().chapter_list.as_deref(),
+            Some("#list a")
+        );
+        assert_eq!(
+            source.rule_content.unwrap().content.as_deref(),
+            Some("#content")
+        );
+    }
+
+    #[test]
+    fn an_empty_legacy_value_does_not_create_a_rule() {
+        let source = book_source_from_value(json!({
+            "bookSourceUrl": "https://x.test",
+            "ruleSearch": { "ruleSearchList": "   " }
+        }))
+        .unwrap();
+        assert_eq!(source.rule_search.and_then(|rule| rule.book_list), None);
     }
 }

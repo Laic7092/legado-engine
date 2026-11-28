@@ -5,26 +5,51 @@ use sha2::Digest;
 use std::io::Read;
 
 fn bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
-    value.as_array().ok_or_else(|| anyhow::anyhow!("需要字节数组"))?.iter()
-        .map(|v| v.as_i64().map(|v| v as u8).ok_or_else(|| anyhow::anyhow!("无效字节"))).collect()
+    value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("需要字节数组"))?
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .map(|v| v as u8)
+                .ok_or_else(|| anyhow::anyhow!("无效字节"))
+        })
+        .collect()
 }
 
-fn output(bytes: Vec<u8>) -> Value { json!(bytes.into_iter().map(|b| b as i8).collect::<Vec<_>>()) }
+fn output(bytes: Vec<u8>) -> Value {
+    json!(bytes.into_iter().map(|b| b as i8).collect::<Vec<_>>())
+}
 
 pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
     let text = |key: &str| payload[key].as_str().unwrap_or("");
     match operation {
         "encode" => {
-            let charset = if text("charset").is_empty() { "UTF-8" } else { text("charset") };
-            let encoding = encoding_rs::Encoding::for_label(charset.as_bytes()).ok_or_else(|| anyhow::anyhow!("不支持字符编码 {charset}"))?;
+            let charset = if text("charset").is_empty() {
+                "UTF-8"
+            } else {
+                text("charset")
+            };
+            let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("不支持字符编码 {charset}"))?;
             Ok(output(encoding.encode(text("text")).0.into_owned()))
         }
         "decode" => {
-            let charset = if text("charset").is_empty() { "UTF-8" } else { text("charset") };
-            let encoding = encoding_rs::Encoding::for_label(charset.as_bytes()).ok_or_else(|| anyhow::anyhow!("不支持字符编码 {charset}"))?;
-            Ok(json!(encoding.decode(&bytes(&payload["data"])?).0.into_owned()))
+            let charset = if text("charset").is_empty() {
+                "UTF-8"
+            } else {
+                text("charset")
+            };
+            let encoding = encoding_rs::Encoding::for_label(charset.as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("不支持字符编码 {charset}"))?;
+            Ok(json!(encoding
+                .decode(&bytes(&payload["data"])?)
+                .0
+                .into_owned()))
         }
-        "base64Encode" => Ok(json!(base64::engine::general_purpose::STANDARD.encode(bytes(&payload["data"])?))),
+        "base64Encode" => Ok(json!(
+            base64::engine::general_purpose::STANDARD.encode(bytes(&payload["data"])?)
+        )),
         // 与 java.base64Decode 一样按 Android/hutool 语义容忍缺省补位。
         "base64Decode" => Ok(output(super::js::decode_base64_lenient(text("text"))?)),
         "digest" => {
@@ -57,22 +82,29 @@ pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
             // 复用 `java.HMacHex` 的算法分发表（返回十六进制），再解回字节：
             // 这样只需维护一处算法映射，也避开 hmac/digest crate 的多版本
             // trait bound 纠缠（依赖树里同时存在 digest 0.10 与 0.11）。
-            let hex_digest = super::js::java_hmac_hex_bytes(&key, &text("algorithm"), &data)?;
+            let hex_digest = super::js::java_hmac_hex_bytes(&key, text("algorithm"), &data)?;
             Ok(output(hex::decode(hex_digest)?))
         }
         "random" => {
-            let length = payload["length"].as_u64().filter(|n| *n <= 16 * 1024 * 1024).ok_or_else(|| anyhow::anyhow!("无效数组长度"))? as usize;
+            let length = payload["length"]
+                .as_u64()
+                .filter(|n| *n <= 16 * 1024 * 1024)
+                .ok_or_else(|| anyhow::anyhow!("无效数组长度"))? as usize;
             let mut data = vec![0; length];
             rand::rngs::OsRng.fill_bytes(&mut data);
             Ok(output(data))
         }
         "cipher" => Ok(output(super::js::symmetric_crypt(
-            payload["encrypt"].as_bool().unwrap_or(false), text("transformation"),
-            &bytes(&payload["key"])? , &bytes(&payload["iv"])? , &bytes(&payload["data"])?
+            payload["encrypt"].as_bool().unwrap_or(false),
+            text("transformation"),
+            &bytes(&payload["key"])?,
+            &bytes(&payload["iv"])?,
+            &bytes(&payload["data"])?,
         )?)),
         "gunzip" => {
             let data = bytes(&payload["data"])?;
-            let mut decoder = flate2::read::GzDecoder::new(data.as_slice()).take(64 * 1024 * 1024 + 1);
+            let mut decoder =
+                flate2::read::GzDecoder::new(data.as_slice()).take(64 * 1024 * 1024 + 1);
             let mut result = Vec::new();
             decoder.read_to_end(&mut result)?;
             anyhow::ensure!(result.len() <= 64 * 1024 * 1024, "解压内容过大");
@@ -103,7 +135,8 @@ pub fn run(operation: &str, payload: &Value) -> anyhow::Result<Value> {
         "gzip" => {
             use std::io::Write;
             let data = bytes(&payload["data"])?;
-            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             encoder.write_all(&data)?;
             Ok(output(encoder.finish()?))
         }

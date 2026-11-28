@@ -1,24 +1,19 @@
 use crate::crawler::http_client::HttpClient;
+use base64::Engine;
 use encoding_rs::Encoding;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
-use base64::Engine;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum HttpMethod {
+    #[default]
     GET,
     POST,
     HEAD,
     PUT,
     PATCH,
     DELETE,
-}
-
-impl Default for HttpMethod {
-    fn default() -> Self {
-        Self::GET
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +49,9 @@ pub struct RequestSpec {
     pub follow_redirects: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// reqwest 的「跳转次数超限」错误。
 ///
@@ -140,7 +137,10 @@ where
         Some(serde_json::Value::Object(map)) => map
             .into_iter()
             .map(|(key, value)| {
-                let value = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+                let value = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
                 (key, value)
             })
             .collect(),
@@ -191,10 +191,14 @@ async fn fetch_inner(
     req: RequestSpec,
     raw: bool,
 ) -> anyhow::Result<FetchResponse> {
-    if let Some(response) = data_uri_response(&req)? { return Ok(response); }
+    if let Some(response) = data_uri_response(&req)? {
+        return Ok(response);
+    }
     let mut last_err: Option<anyhow::Error> = None;
     let max_retries = req.retry;
     for attempt in 0..=max_retries {
+        // 每次尝试前检查取消，避免取消后还去等超时。
+        crate::cancel::check()?;
         let req = req.clone();
         let mut builder = match req.method {
             HttpMethod::GET => request_client.get(&req.url),
@@ -245,13 +249,17 @@ async fn fetch_inner(
                     reqwest::header::CONTENT_TYPE,
                     if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
                         "application/json"
-                    } else { "application/x-www-form-urlencoded" },
+                    } else {
+                        "application/x-www-form-urlencoded"
+                    },
                 );
             }
             builder = builder.body(body);
         }
 
-        let sent = builder.send().await;
+        // `guard` 一被取消就把 `send` 的 future 丢掉，reqwest 随之关掉连接 ——
+        // 这才是"立刻停"而不是"等下一次超时"。
+        let sent = crate::cancel::guard(builder.send()).await?;
         // 换域跳转会让「显式 `Host`」变成毒药：reqwest 跟随 3xx 时原样沿用我们注入
         // 的 `Host`，目标是新域却仍宣称旧域，对端于是再回 301 指回新域，直到
         // `too many redirects`（实测 `m.xxx.net` → `m.xxx.com` 必现）。
@@ -314,10 +322,13 @@ async fn fetch_inner(
                 } else if let Some(body) = req.body.clone() {
                     retry = retry.body(body);
                 }
-                retry.send().await
+                crate::cancel::guard(retry.send()).await?
             }
             other => other,
         };
+        // 429 / 503 想让人等多久，由站点自己说（`Retry-After`）。默认那 200ms 的
+        // 退避对限速站等于没等：连着撞三次只会把限速窗口拖长。
+        let mut wait_hint: Option<Duration> = None;
         match sent {
             Ok(res) => {
                 let status = res.status().as_u16();
@@ -338,7 +349,8 @@ async fn fetch_inner(
                             .map(|value| (name.to_string(), value.to_string()))
                     })
                     .collect::<Vec<_>>();
-                let bytes = res.bytes().await?;
+                // 读 body 同样可以取消（下载中途放弃）。
+                let bytes = crate::cancel::guard(res.bytes()).await??;
                 // 只有字节级请求才需要保留原始字节; 文本路径直接解码,
                 // 避免每个响应都多一次整体拷贝。
                 let raw_body = if raw { bytes.to_vec() } else { Vec::new() };
@@ -368,16 +380,14 @@ async fn fetch_inner(
                 //       if (response.isSuccessful) return response
                 //   }
                 //
-                // 早先这里只对 `status >= 500` 重试，服务端 4xx 直接返回。这在
-                // 「一次性挑战 Cookie」的站点上是致命的：`xsbook.org`(Tengine)
-                // 对未授权的请求回 403 + `Set-Cookie: <随机名>=<值>`，带上这个
-                // Cookie 后同一请求就 200。书源脚本恰恰先用
-                // `cookie.removeCookie(base)` 清掉 Cookie（为了绕限频），于是
-                // **每个** 详情/目录/正文请求都要重新过一次挑战；只重试 5xx
-                // 时永远停在那条 403 上，界面症状就是「目录正文加载不出来」。
+                // 重试所有非 2xx，不只是 5xx：「一次性挑战 Cookie」的站点
+                // （如 xsbook.org，Tengine）对未授权请求回 403 +
+                // `Set-Cookie: <随机名>=<值>`，带上即 200；书源脚本为绕限频会先
+                // 清 Cookie，于是每个详情/目录/正文请求都要再过一次挑战。
                 //
                 // 重试次数仍由书源的 `retry` 选项决定（默认 2），不额外放大。
                 if !is_successful && attempt < max_retries {
+                    wait_hint = retry_after(&status, &headers);
                     last_err = Some(anyhow::anyhow!("request failed with status {}", status));
                 } else {
                     return Ok(FetchResponse {
@@ -397,12 +407,35 @@ async fn fetch_inner(
         }
 
         if attempt < max_retries {
-            let backoff = 200u64 * (attempt as u64 + 1);
-            sleep(Duration::from_millis(backoff)).await;
+            let wait = wait_hint
+                .take()
+                .unwrap_or_else(|| Duration::from_millis(200 * (attempt as u64 + 1)));
+            // 退避期间同样可以取消。
+            crate::cancel::guard(sleep(wait)).await?;
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("fetch failed")))
 }
+
+/// `Retry-After` 告诉我们的等待时长。
+///
+/// 只认整数秒（HTTP-date 形态少见，退回到默认退避），并且压一个上限：站点完全可以
+/// 回 `Retry-After: 3600`，真等一小时比失败还难受。10 秒足够避开一次限速窗口。
+fn retry_after(status: &u16, headers: &[(String, String)]) -> Option<Duration> {
+    if !matches!(status, 429 | 503) {
+        return None;
+    }
+    let seconds = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.trim())?
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.clamp(1, MAX_RETRY_AFTER_SECS)))
+}
+
+/// `Retry-After` 的上限。
+const MAX_RETRY_AFTER_SECS: u64 = 10;
 
 fn url_host(url: &str) -> Option<String> {
     url::Url::parse(url)
@@ -410,15 +443,21 @@ fn url_host(url: &str) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
 }
 
-pub(crate) fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {
+pub(crate) fn decode_body(
+    bytes: &[u8],
+    charset: Option<&str>,
+    content_type: Option<&str>,
+) -> String {
     // URL charset controls request encoding. A declared response encoding takes
     // precedence, including HTML pages returned by an UTF-8 search endpoint.
     let label = charset_from_content_type(content_type)
         .or_else(|| charset_from_html_meta(bytes))
-        .or_else(|| charset
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string));
+        .or_else(|| {
+            charset
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
 
     let text = if let Some(label) = label {
         match Encoding::for_label(label.trim().as_bytes()) {
@@ -467,19 +506,43 @@ fn host_header_value(url: &str) -> Option<String> {
 }
 
 pub(crate) fn data_uri_response(req: &RequestSpec) -> anyhow::Result<Option<FetchResponse>> {
-    let Some(data) = req.url.strip_prefix("data:") else { return Ok(None) };
-    let (meta, payload) = data.split_once(',').ok_or_else(|| anyhow::anyhow!("无效的内嵌数据地址"))?;
+    let Some(data) = req.url.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let (meta, payload) = data
+        .split_once(',')
+        .ok_or_else(|| anyhow::anyhow!("无效的内嵌数据地址"))?;
     let decoded = urlencoding::decode_binary(payload.as_bytes());
-    let bytes = if meta.split(';').any(|part| part.eq_ignore_ascii_case("base64")) {
+    let bytes = if meta
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
         base64::engine::general_purpose::STANDARD.decode(decoded.as_ref())?
-    } else { decoded.into_owned() };
-    let content_type = meta.split(';').filter(|part| !part.eq_ignore_ascii_case("base64")).collect::<Vec<_>>().join(";");
-    let body = if req.response_type.as_deref().is_some_and(|value| !value.is_empty()) {
+    } else {
+        decoded.into_owned()
+    };
+    let content_type = meta
+        .split(';')
+        .filter(|part| !part.eq_ignore_ascii_case("base64"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let body = if req
+        .response_type
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
         hex::encode(&bytes)
-    } else { decode_body(&bytes, req.charset.as_deref(), Some(&content_type)) };
+    } else {
+        decode_body(&bytes, req.charset.as_deref(), Some(&content_type))
+    };
     Ok(Some(FetchResponse {
-        url: req.url.clone(), status: 200, body, raw_body: bytes, content_type: Some(content_type),
-        headers: Vec::new(), is_successful: true,
+        url: req.url.clone(),
+        status: 200,
+        body,
+        raw_body: bytes,
+        content_type: Some(content_type),
+        headers: Vec::new(),
+        is_successful: true,
     }))
 }
 

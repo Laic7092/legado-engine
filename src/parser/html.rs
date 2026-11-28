@@ -111,10 +111,7 @@ fn wrap_bare_fragment(fragment: &str) -> Option<String> {
         ),
         "li" => ("<ul data-reader-fragment-wrap=\"li\">", "</ul>"),
         "dt" | "dd" => ("<dl data-reader-fragment-wrap=\"dl\">", "</dl>"),
-        "option" | "optgroup" => (
-            "<select data-reader-fragment-wrap=\"option\">",
-            "</select>",
-        ),
+        "option" | "optgroup" => ("<select data-reader-fragment-wrap=\"option\">", "</select>"),
         "legend" => (
             "<fieldset data-reader-fragment-wrap=\"legend\">",
             "</fieldset>",
@@ -164,8 +161,7 @@ fn legado_to_css(selector: &str) -> String {
     let selector = selector.trim();
 
     // Handle special "class." prefix - multiple classes separated by space
-    if selector.starts_with("class.") {
-        let rest = &selector[6..];
+    if let Some(rest) = selector.strip_prefix("class.") {
         let classes: Vec<&str> = rest.split_whitespace().collect();
         if classes.len() > 1 {
             return format!(".{}", classes.join("."));
@@ -175,13 +171,13 @@ fn legado_to_css(selector: &str) -> String {
     }
 
     // Handle id. prefix
-    if selector.starts_with("id.") {
-        return format!("#{}", &selector[3..]);
+    if let Some(rest) = selector.strip_prefix("id.") {
+        return format!("#{rest}");
     }
 
     // Handle tag. prefix
-    if selector.starts_with("tag.") {
-        return selector[4..].to_string();
+    if let Some(rest) = selector.strip_prefix("tag.") {
+        return rest.to_string();
     }
 
     // Already CSS selector format (index will be stripped in parse_selector_with_index)
@@ -258,10 +254,9 @@ fn parse_bracket_index_spec(selector: &str) -> Option<(&str, IndexMode, Vec<Inde
             if part.is_empty() {
                 continue;
             }
-            if let Some(item) = parse_bracket_index_item(part) {
+            {
+                let item = parse_bracket_index_item(part)?;
                 items.push(item);
-            } else {
-                return None;
             }
         }
     }
@@ -368,7 +363,11 @@ fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<El
     // `class.zjlb@class.lb@ul@li`：`<ul class="lb fk">` 里面直接就是 `<li>`，
     // 并没有嵌套的 `<ul>`，第二步 `@ul` 靠的正是「自身也匹配」。少了这一步，
     // 目录恒为 0 条（手机端能读、桌面端没有章节）。
-    let mut matches: Vec<ElementRef<'a>> = if sel.matches(&el) { vec![el] } else { Vec::new() };
+    let mut matches: Vec<ElementRef<'a>> = if sel.matches(&el) {
+        vec![el]
+    } else {
+        Vec::new()
+    };
     matches.extend(el.select(&sel));
     if let Some(filters) = filters {
         apply_jsoup_filters(&mut matches, &filters);
@@ -377,7 +376,9 @@ fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<El
 }
 
 fn select_css_plain<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let Some(sel) = parse_css_selector(css_selector) else { return vec![] };
+    let Some(sel) = parse_css_selector(css_selector) else {
+        return vec![];
+    };
     doc.select(&sel).collect()
 }
 
@@ -478,9 +479,9 @@ fn split_jsoup_pseudos(selector: &str) -> Option<(String, Vec<JsoupFilter>)> {
             "containsOwn" => Some(JsoupFilter::ContainsOwn(unescape_pseudo_text(&arg))),
             "containsData" => Some(JsoupFilter::ContainsData(unescape_pseudo_text(&arg))),
             "containsWholeText" => Some(JsoupFilter::ContainsWholeText(unescape_pseudo_text(&arg))),
-            "containsWholeOwnText" => {
-                Some(JsoupFilter::ContainsWholeOwnText(unescape_pseudo_text(&arg)))
-            }
+            "containsWholeOwnText" => Some(JsoupFilter::ContainsWholeOwnText(
+                unescape_pseudo_text(&arg),
+            )),
             "matches" => Some(JsoupFilter::Matches(arg)),
             "matchesOwn" => Some(JsoupFilter::MatchesOwn(arg)),
             "matchesWholeText" => Some(JsoupFilter::MatchesWholeText(arg)),
@@ -596,7 +597,11 @@ fn apply_jsoup_filters<'a>(matches: &mut Vec<ElementRef<'a>>, filters: &[JsoupFi
             }
             JsoupFilter::Contains(text) => {
                 let needle = text.to_lowercase();
-                matches.retain(|el| normalize_ws(&full_text(el)).to_lowercase().contains(&needle));
+                matches.retain(|el| {
+                    normalize_ws(&full_text(el))
+                        .to_lowercase()
+                        .contains(&needle)
+                });
             }
             JsoupFilter::ContainsOwn(text) => {
                 let needle = text.to_lowercase();
@@ -620,19 +625,27 @@ fn apply_jsoup_filters<'a>(matches: &mut Vec<ElementRef<'a>>, filters: &[JsoupFi
                 matches.retain(|el| own_text(el).contains(text.as_str()));
             }
             JsoupFilter::Matches(pattern) => {
-                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                let Ok(re) = regex::Regex::new(pattern) else {
+                    continue;
+                };
                 matches.retain(|el| re.is_match(&normalize_ws(&full_text(el))));
             }
             JsoupFilter::MatchesOwn(pattern) => {
-                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                let Ok(re) = regex::Regex::new(pattern) else {
+                    continue;
+                };
                 matches.retain(|el| re.is_match(&normalize_ws(&own_text(el))));
             }
             JsoupFilter::MatchesWholeText(pattern) => {
-                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                let Ok(re) = regex::Regex::new(pattern) else {
+                    continue;
+                };
                 matches.retain(|el| re.is_match(&full_text(el)));
             }
             JsoupFilter::MatchesWholeOwnText(pattern) => {
-                let Ok(re) = regex::Regex::new(pattern) else { continue };
+                let Ok(re) = regex::Regex::new(pattern) else {
+                    continue;
+                };
                 matches.retain(|el| re.is_match(&own_text(el)));
             }
             JsoupFilter::Empty => {
@@ -700,11 +713,16 @@ fn normalize_ws(text: &str) -> String {
     out.trim_end().to_string()
 }
 
-fn parse_css_selector(selector: &str) -> Option<Selector> {    if let Ok(parsed) = Selector::parse(selector) { return Some(parsed); }
+fn parse_css_selector(selector: &str) -> Option<Selector> {
+    if let Ok(parsed) = Selector::parse(selector) {
+        return Some(parsed);
+    }
     // Jsoup accepts values such as [property=og:novel:book_name] without
     // quotes. Quote these values before handing the selector to scraper.
     static ATTR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = ATTR.get_or_init(|| regex::Regex::new(r#"(\[[^\]\s=~|^$*]+[~|^$*]?=)([^"'\]\s]+)(\])"#).unwrap());
+    let re = ATTR.get_or_init(|| {
+        regex::Regex::new(r#"(\[[^\]\s=~|^$*]+[~|^$*]?=)([^"'\]\s]+)(\])"#).unwrap()
+    });
     let normalized = re.replace_all(selector, "${1}\"${2}\"${3}");
     Selector::parse(&normalized).ok()
 }
@@ -862,11 +880,16 @@ fn expand_range(len: usize, start: Option<i32>, end: Option<i32>, step: i32) -> 
 /// Select elements with Legado rule syntax
 pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
     let selector = selector.trim();
-    if split_top_level(selector, &["&&", "||", "%%"]).delimiter.is_some() {
+    if split_top_level(selector, &["&&", "||", "%%"])
+        .delimiter
+        .is_some()
+    {
         return select_with_combination(doc, selector);
     }
     let parts = split_top_level(selector, &["@"]).parts;
-    let Some(first) = parts.first() else { return vec![] };
+    let Some(first) = parts.first() else {
+        return vec![];
+    };
     // 空选择器 = "当前元素自身"（legado `element.select("")` 返回元素自身）。
     //
     // 调用方**只在规则里还有提取器时**才该走到这里（`select_text_list` 把
@@ -879,8 +902,10 @@ pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
     };
     for part in parts.iter().skip(1) {
         let parsed = parse_selector_with_index(part);
-        matches = matches.into_iter()
-            .flat_map(|el| collect_matches_from_element(el, &parsed)).collect();
+        matches = matches
+            .into_iter()
+            .flat_map(|el| collect_matches_from_element(el, &parsed))
+            .collect();
     }
     matches
 }
@@ -993,10 +1018,9 @@ pub fn extract_text(el: &ElementRef, extractor: &str) -> Option<String> {
                 return el.value().attr(attr_name).map(|v| v.to_string());
             }
 
-            if extractor.starts_with('@') {
-                el.value().attr(&extractor[1..]).map(|v| v.to_string())
-            } else {
-                el.value().attr(extractor).map(|v| v.to_string())
+            match extractor.strip_prefix('@') {
+                Some(name) => el.value().attr(name).map(|v| v.to_string()),
+                None => el.value().attr(extractor).map(|v| v.to_string()),
             }
         }
     }
@@ -1035,7 +1059,8 @@ fn element_outer_html_without_scripts(el: &ElementRef) -> String {
         .unwrap_or(original)
 }
 
-fn parse_attr_extractor(extractor: &str) -> Option<&str> {    let extractor = extractor.trim();
+fn parse_attr_extractor(extractor: &str) -> Option<&str> {
+    let extractor = extractor.trim();
     let extractor = extractor.strip_prefix('@').unwrap_or(extractor);
     extractor
         .strip_prefix("attr[")
@@ -1099,10 +1124,10 @@ pub fn select_text_from_element(el: &ElementRef, rule: &str) -> Option<String> {
 
 /// Select all matching elements and collect their text, joined by newlines.
 ///
-/// 多级链式(`class.pic.0@tag.img@src`)必须**逐级下钻**: 早先这里把 `@` 后的
-/// 整段当成"一个提取器", 多级规则全部取不到值 —— 某书源详情页
-/// `coverUrl = {{@@class.pic.0@tag.img@src}}` 因此恒为空, 详情页没有封面
-/// (列表页的 coverUrl 走 element 级求值, 不受影响)。
+/// 多级链式(`class.pic.0@tag.img@src`)必须**逐级下钻**: 把 `@` 后的整段当成
+/// "一个提取器"会让多级规则取不到值（详情页
+/// `coverUrl = {{@@class.pic.0@tag.img@src}}` 恒为空; 列表页走 element 级求值,
+/// 不受影响）。
 ///
 /// 无提取器的单段规则(`class.content`)保持原有 `textNodes` 语义: 文本节点按
 /// **换行**拼接, 正文段落靠它保留换行, 不能退化成空格拼接。
@@ -1255,7 +1280,10 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     }
 
     let (selector, extractor) = if parts.len() > 1 {
-        (parts[..parts.len()-1].join("@"), parts.last().unwrap().as_str())
+        (
+            parts[..parts.len() - 1].join("@"),
+            parts.last().unwrap().as_str(),
+        )
     } else {
         (parts[0].clone(), "text")
     };
@@ -1264,8 +1292,10 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     if selector.trim().is_empty() && parts.len() == 1 {
         return vec![];
     }
-    select_list(doc, &selector).into_iter()
-        .filter_map(|el| extract_text(&el, extractor)).collect()
+    select_list(doc, &selector)
+        .into_iter()
+        .filter_map(|el| extract_text(&el, extractor))
+        .collect()
 }
 
 /// XPath support using sxd-xpath
@@ -1505,7 +1535,9 @@ pub fn html_to_xml(html: &str) -> String {
         "source", "track", "wbr",
     ];
     fn escape_text(text: &str) -> String {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
     fn escape_attr(value: &str) -> String {
         value
@@ -1604,12 +1636,13 @@ pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// 多级链式(`class.pic.0@tag.img@src`)必须逐级下钻后取末段提取器。
-    /// 某书源详情页 `coverUrl` 模板就是这么写的; 早先的 select_all_text 把
-    /// `@` 之后的整段当成"单个提取器", 多级规则恒为空 → 详情页无封面。
+    /// 多级链式(`class.pic.0@tag.img@src`)必须逐级下钻后取末段提取器:
+    /// `@` 之后整段当成"单个提取器"时多级规则恒为空（详情页无封面）。
     #[test]
     fn test_select_all_text_multi_level_chain() {
-        let doc = parse_document(r#"<html><body><div class="pic"><a href="/b/1.html"><img src="/bookimg/9.jpg"></a></div></body></html>"#);
+        let doc = parse_document(
+            r#"<html><body><div class="pic"><a href="/b/1.html"><img src="/bookimg/9.jpg"></a></div></body></html>"#,
+        );
         assert_eq!(
             select_all_text(&doc, "class.pic.0@tag.img@src").as_deref(),
             Some("/bookimg/9.jpg")
@@ -1624,7 +1657,9 @@ mod tests {
     /// (正文段落靠它保留换行)。
     #[test]
     fn test_select_all_text_single_rule_keeps_text_nodes_newlines() {
-        let doc = parse_document("<html><body><div class=\"content\">第一段<br>第二段</div></body></html>");
+        let doc = parse_document(
+            "<html><body><div class=\"content\">第一段<br>第二段</div></body></html>",
+        );
         let text = select_all_text(&doc, "class.content").unwrap_or_default();
         assert!(text.contains("第一段"), "got {text:?}");
         assert!(text.contains("第二段"), "got {text:?}");
@@ -1801,7 +1836,10 @@ mod tests {
             ("//div".to_string(), Some("node"))
         );
         // 无 :: → 原样
-        assert_eq!(split_xpath_axis("//div/span"), ("//div/span".to_string(), None));
+        assert_eq!(
+            split_xpath_axis("//div/span"),
+            ("//div/span".to_string(), None)
+        );
         // 无内容
         assert_eq!(split_xpath_axis(""), ("".to_string(), None));
     }
@@ -1830,7 +1868,10 @@ mod tests {
         let doc = Html::parse_document(
             r#"<div class="con"><style>.x{color:red}</style><script>var a='</p>';</script><p>正文</p></div>"#,
         );
-        let el = doc.select(&Selector::parse("div.con").unwrap()).next().unwrap();
+        let el = doc
+            .select(&Selector::parse("div.con").unwrap())
+            .next()
+            .unwrap();
 
         let html = extract_text(&el, "html").unwrap();
         assert_eq!(html, r#"<div class="con"><p>正文</p></div>"#);

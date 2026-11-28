@@ -1,9 +1,9 @@
-pub mod cache_manifest;
 pub mod book;
 pub mod book_chapter;
 pub mod book_group;
 pub mod book_source;
 pub mod bookmark;
+pub mod cache_manifest;
 pub mod http_tts;
 pub mod replace_rule;
 pub mod rss;

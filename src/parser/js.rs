@@ -1,6 +1,6 @@
+use crate::crawler::fetcher::{HttpMethod, RequestSpec};
 use crate::crawler::url_analyzer::parse_source_headers;
 use crate::crawler::{http_client::HttpClient, source_session::SourceHttpContext};
-use crate::crawler::fetcher::{HttpMethod, RequestSpec};
 use crate::model::book_source::BookSource;
 use crate::util::hash::md5_hex;
 use crate::util::text::{apply_regex_replace, normalize_source_url, strip_whitespace};
@@ -13,13 +13,13 @@ use chrono::{Local, TimeZone, Utc};
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use once_cell::sync::Lazy;
-use sha1::Sha1;
-use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use reqwest::blocking::Client;
 use rquickjs::context::EvalOptions;
 use rquickjs::function::{Func, Opt};
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::{json, Value as JsonValue};
+use sha1::Sha1;
+use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -73,10 +73,23 @@ const JS_KV_MAX_VALUE_BYTES: usize = 1024 * 1024;
 static JS_STORE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(load_js_store()));
 static JS_STORAGE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static JS_DEFAULT_HTTP: OnceLock<HttpClient> = OnceLock::new();
-static JS_FALLBACK_HTTP: Lazy<HttpClient> = Lazy::new(|| HttpClient::new(30, None).expect("JS HTTP client"));
-static JS_HTTP_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("JS HTTP runtime"));
-/// 组装好的 jsLib 源码, 按 jsLib 文本 md5 缓存; `Some(Instant)` 表示含下载失败项, 到期后重试。
-static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, (String, Option<Instant>)>>> =
+static JS_FALLBACK_HTTP: Lazy<HttpClient> =
+    Lazy::new(|| HttpClient::new(30, None).expect("JS HTTP client"));
+static JS_HTTP_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("JS HTTP runtime")
+});
+/// 编译好的 jsLib: 源码, 以及「有下载失败的条目、到期后重试」的时刻。
+struct CachedJsLib {
+    source: String,
+    retry_at: Option<Instant>,
+}
+
+/// jsLib 源码缓存, 按 jsLib 文本的 md5 索引。
+static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, CachedJsLib>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const JS_LIB_RETRY_AFTER: Duration = Duration::from_secs(60);
 // Signature helpers can nest JS and Rust crypto calls beyond QuickJS's 256 KiB
@@ -95,7 +108,10 @@ static JS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         // jsLib 常托管在与源站同一批小站上，自签名/过期证书很常见。
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
-        .timeout(Duration::from_secs(30))
+        // 与书源 client 用同一个默认总超时，别让脚本里的请求比引擎自己的还慢。
+        .timeout(Duration::from_secs(
+            crate::crawler::http_client::DEFAULT_TIMEOUT_SECS,
+        ))
         .build()
         .expect("failed to build JS HTTP client")
 });
@@ -140,7 +156,7 @@ pub struct LoginEffects {
     /// `source.login()` 被脚本调用: 调用方应重跑 loginUrl 并重取响应。
     pub login: bool,
     /// `java.refreshExplore()` 被脚本调用: 调用方应刷新发现页分类与列表。
-    /// 与 `refresh`(重登录视图) 是两件事 —— 早先两者被混为一谈。
+    /// 与 `refresh`(重登录视图) 是两件事。
     pub explore_refresh: bool,
 }
 
@@ -174,7 +190,10 @@ pub fn take_explore_intents() -> Vec<(String, String)> {
     EXPLORE_INTENTS.with(|cell| {
         std::mem::take(&mut *cell.borrow_mut())
             .into_iter()
-            .filter_map(|raw| raw.split_once('\u{1}').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|raw| {
+                raw.split_once('\u{1}')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect()
     })
 }
@@ -186,7 +205,9 @@ pub fn set_js_storage_dir(dir: impl Into<PathBuf>) {
     let _ = JS_STORAGE_DIR.set(dir.into());
 }
 
-pub fn set_js_http_client(http: HttpClient) { let _ = JS_DEFAULT_HTTP.set(http); }
+pub fn set_js_http_client(http: HttpClient) {
+    let _ = JS_DEFAULT_HTTP.set(http);
+}
 
 pub fn with_http_context<T>(http: SourceHttpContext, f: impl FnOnce() -> T) -> T {
     with_thread_local(&ACTIVE_HTTP, Some(http), f)
@@ -198,7 +219,9 @@ pub fn with_search_context<T>(key: &str, page: i32, f: impl FnOnce() -> T) -> T 
 
 pub fn source_http_context(source_url: &str) -> anyhow::Result<SourceHttpContext> {
     if let Some(http) = ACTIVE_HTTP.with(|cell| cell.borrow().clone()) {
-        if http.session.source_url == source_url.trim() { return Ok(http); }
+        if http.session.source_url == source_url.trim() {
+            return Ok(http);
+        }
     }
     let http = JS_DEFAULT_HTTP.get().unwrap_or(&JS_FALLBACK_HTTP);
     let namespace = http.user_ns();
@@ -217,7 +240,9 @@ pub fn set_last_response(raw: &str) {
 
 fn cookie_tag_url(tag: &str) -> Option<url::Url> {
     let tag = tag.trim();
-    if tag.is_empty() { return None; }
+    if tag.is_empty() {
+        return None;
+    }
     let absolute = if tag.contains("://") {
         tag.to_string()
     } else if tag.starts_with("//") {
@@ -225,14 +250,17 @@ fn cookie_tag_url(tag: &str) -> Option<url::Url> {
     } else {
         format!("https://{tag}")
     };
-    url::Url::parse(&absolute).ok().filter(|url| {
-        matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
-    })
+    url::Url::parse(&absolute)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 pub fn login_headers() -> Vec<(String, String)> {
-    active_source().http.and_then(|http| http.session.get("loginHeader"))
-        .map(|raw| parse_source_headers(&raw)).unwrap_or_default()
+    active_source()
+        .http
+        .and_then(|http| http.session.get("loginHeader"))
+        .map(|raw| parse_source_headers(&raw))
+        .unwrap_or_default()
 }
 
 fn with_thread_local<V: 'static, T>(
@@ -240,11 +268,19 @@ fn with_thread_local<V: 'static, T>(
     value: Option<V>,
     f: impl FnOnce() -> T,
 ) -> T {
-    struct Restore<V: 'static> { key: &'static std::thread::LocalKey<RefCell<Option<V>>>, previous: Option<V> }
-    impl<V: 'static> Drop for Restore<V> {
-        fn drop(&mut self) { self.key.with(|cell| cell.replace(self.previous.take())); }
+    struct Restore<V: 'static> {
+        key: &'static std::thread::LocalKey<RefCell<Option<V>>>,
+        previous: Option<V>,
     }
-    let _restore = Restore { key, previous: key.with(|cell| cell.replace(value)) };
+    impl<V: 'static> Drop for Restore<V> {
+        fn drop(&mut self) {
+            self.key.with(|cell| cell.replace(self.previous.take()));
+        }
+    }
+    let _restore = Restore {
+        key,
+        previous: key.with(|cell| cell.replace(value)),
+    };
     f()
 }
 
@@ -255,8 +291,13 @@ pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
 /// 设置当前书源(jsLib + `source` 信息 + 默认请求头)后执行 f。
 pub fn with_source<T>(source: &BookSource, f: impl FnOnce() -> T) -> T {
     let raw_header = source.header.as_deref().unwrap_or_default().trim();
-    let header_script = raw_header.strip_prefix("@js:")
-        .or_else(|| raw_header.strip_prefix("<js>").and_then(|text| text.strip_suffix("</js>")))
+    let header_script = raw_header
+        .strip_prefix("@js:")
+        .or_else(|| {
+            raw_header
+                .strip_prefix("<js>")
+                .and_then(|text| text.strip_suffix("</js>"))
+        })
         .map(str::to_string);
     let headers = source
         .header
@@ -402,7 +443,9 @@ fn store_get(key: &str) -> Option<String> {
 /// Source-script reading preferences for this book. Merge these into a Book's
 /// readConfig when returning metadata or creating a later JavaScript context.
 pub fn book_read_config_override(source_url: &str, book_url: &str) -> Option<JsonValue> {
-    if book_url.trim().is_empty() { return None; }
+    if book_url.trim().is_empty() {
+        return None;
+    }
     let source_url = normalize_source_url(source_url);
     let source_url = source_url.trim_end_matches('/');
     match store_get(&format!("brc:{source_url}:{book_url}")).as_deref() {
@@ -560,7 +603,16 @@ pub fn eval_js_search_with_source(
     // 书源地址：`with_source` 已提供 source 绑定，这里只是它的空值回退。
     source_key: &str,
 ) -> anyhow::Result<String> {
-    eval_js_inner_with_source(script, None, None, Some(key), Some(page), Some(source_key), None, None)
+    eval_js_inner_with_source(
+        script,
+        None,
+        None,
+        Some(key),
+        Some(page),
+        Some(source_key),
+        None,
+        None,
+    )
 }
 
 /// 求值发现页分类里的 `exploreUrl`（`@js:` / `<js>` 规则）。
@@ -1314,10 +1366,8 @@ const JS_PRELUDE: &str = r#"(function (g) {
       // `while (getResult(...) == null) LockSupport.parkNanos(...)` 里一直等，
       // 直到用户关掉 WebView 才继续。
       //
-      // 书源就是按这个语义写的 —— 打开登录页 → 等用户登录 → 关窗 → 抓 Cookie。
-      // 早先这里只 `__open_external_window` 就立刻返回空 Resp，下一行立刻去抓
-      // Cookie，抓到的是未登录会话：番茄登录因此永远「保存失败」，诊断页也不
-      // 会出现（yckceo 8054）。
+      // 书源按这个语义写：打开登录页 → 等用户登录 → 关窗 → 抓 Cookie。
+      // 因此必须等窗口关闭再返回，否则下一步抓到的是未登录会话。
       try {
         var r = JSON.parse(g.__await_external_window(target, S(title)));
         if (!r.ok) throw new Error(r.error || '网页操作未完成');
@@ -1837,8 +1887,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   };
   J.util = { HashMap: HashMap, LinkedHashMap: HashMap, Map: HashMap, ArrayList: ArrayList };
   // `java.io.*` 由 `java_compat.js` 提供（ByteArrayInputStream/OutputStream、
-  // GZIP、Reader 等），这里不再重复实现 —— 早先在这里加过一份同名构造，
-  // 结果被 compat 的同名注册覆盖，`available()` 之类的差异就变成了灵异现象。
+  // GZIP、Reader 等），此处不再注册同名构造：后注册的会覆盖 compat 里的实现。
   // `new java.util.Date()` / `Date(millis)`: 书源用它做时间戳运算。
   // `getTime()` 与 JS 一致; `toString()` 按 ISO 给出可读时间。
   J.util.Date = function (millis) {
@@ -2502,12 +2551,10 @@ const JS_PRELUDE: &str = r#"(function (g) {
   // legado 的 `getLoginHeaderMap()` 在**没有登录头**时返回 `null`（`BookSource.kt`：
   // `getLoginHeader()` 为空直接 `null`，否则 GSON 反序列化成 Map）。
   //
-  // 书源普遍靠这个判空来触发「首次取 token」：
+  // 书源靠这个判空触发「首次取 token」：
   //   if (source.getLoginHeaderMap() == null) { this.Token(); }
-  // 早先这里恒返回 `{}`，条件永不成立，`Token()` 从不执行 —— 后续请求全部缺少
-  // `authorization`，接口回 `401 Api Gateway Auth ERROR`。
-  // 界面症状：**详情简介只剩标签、目录 0 章、正文空白**，而搜索正常
-  // （搜索接口不校验 token）。
+  // 因此没有登录头时必须返回 null，不能返回 `{}`，否则条件永不成立，
+  // 后续请求都缺 `authorization`（搜索不受影响，详情/目录/正文全空）。
   src.getLoginHeaderMap = function () {
     var raw = src.getLoginHeader();
     if (raw === null || raw === undefined || String(raw).trim() === '' || String(raw).trim() === '{}') return null;
@@ -2568,8 +2615,7 @@ const JS_PRELUDE: &str = r#"(function (g) {
   J.upLoginData = function (data) { g.__login_update(JSON.stringify(data == null ? null : data)); };
   J.reLoginView = function () { g.__login_refresh(); };
   // legado: `java.refreshExplore()` 刷新发现页（只重算分类，不重跑登录）。
-  // 早先把它等同于 reLoginView 是错的：某类书源的「🔄刷新」按钮会因此弹出
-  // 登录面板，而不是刷新发现页。
+  // 与 `reLoginView` 不同：后者会弹登录面板。
   J.refreshExplore = function (flag) { g.__explore_refresh(flag === undefined ? '' : S(flag)); return true; };
   src.put = function (k, v) { g.__store_put('sp:' + si.url + ':' + S(k), S(v)); return v; };
   src.get = function (k) { return g.__store_get('sp:' + si.url + ':' + S(k)) || ''; };
@@ -2697,6 +2743,77 @@ thread_local! {
     /// 当前线程的 eval 嵌套深度。rquickjs 的 `Context::with` 不可重入,
     /// 所以嵌套 eval(例如 `js:` 规则里再调 `java.getString`)必须换用独立上下文。
     static JS_EVAL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 当前脚本的截止时刻。rquickjs 的 interrupt handler 在 JS 执行期间被
+    /// 周期调用, 只能读全局状态, 所以截止时刻放线程局部。
+    static JS_SCRIPT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// 一个脚本最多跑多久。
+///
+/// 这不是性能限制, 是**兜住死循环**用的: 书源脚本里 `while (true)`、递归爬取、
+/// 忘记 break 的循环都真实存在过, 没有上限就意味着宿主线程永远回不来。
+/// 用到 120 秒的脚本基本可以判定写坏了 —— 正常的搜索/正文脚本 1 秒内结束,
+/// 带两三次 `java.ajax` 的登录流程也就几十秒。取消(`legado_cancel`)响应得更快,
+/// 它走同一条中断路径。
+const JS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 给 JS 引擎装上中断条件: 调用被取消, 或者脚本跑超了 [`JS_SCRIPT_TIMEOUT`]。
+///
+/// rquickjs 在 JS 执行期间轮询这个回调, 返回 `true` 即中止脚本 —— 返回时线程
+/// 已经停下, 不会留下一个还在跑的后台线程。
+fn install_interrupt_handler(runtime: &Runtime) {
+    runtime.set_interrupt_handler(Some(Box::new(|| {
+        crate::cancel::requested() || script_deadline_passed()
+    })));
+}
+
+fn script_deadline_passed() -> bool {
+    JS_SCRIPT_DEADLINE.with(|deadline| deadline.get().is_some_and(|at| Instant::now() >= at))
+}
+
+/// 进入脚本时登记截止时刻, 退出时清掉。
+///
+/// 嵌套 eval 保留最外层的截止时刻: 内层脚本不该因为自己"重新开始计时"
+/// 而把整条规则链的预算翻倍。
+struct ScriptDeadline {
+    /// 只有最外层那次 eval 负责在退出时清掉截止时刻。
+    owned: bool,
+}
+
+impl ScriptDeadline {
+    fn start() -> Self {
+        let owned = JS_SCRIPT_DEADLINE.with(|slot| {
+            if slot.get().is_none() {
+                slot.set(Some(Instant::now() + JS_SCRIPT_TIMEOUT));
+                true
+            } else {
+                false
+            }
+        });
+        Self { owned }
+    }
+}
+
+/// 中断原因: 取消优先于超时(两者都成立时按取消报, 宿主才认得出是自己叫停的)。
+fn stop_reason() -> Option<anyhow::Error> {
+    if crate::cancel::requested() {
+        return Some(crate::cancel::error());
+    }
+    if script_deadline_passed() {
+        return Some(anyhow::anyhow!(
+            "the script ran longer than {}s and was stopped",
+            JS_SCRIPT_TIMEOUT.as_secs()
+        ));
+    }
+    None
+}
+
+impl Drop for ScriptDeadline {
+    fn drop(&mut self) {
+        if self.owned {
+            JS_SCRIPT_DEADLINE.with(|slot| slot.set(None));
+        }
+    }
 }
 
 /// 退出时把嵌套深度减回去。
@@ -2731,6 +2848,7 @@ fn with_reusable_context<T>(
     if nested {
         let runtime = Runtime::new()?;
         runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
+        install_interrupt_handler(&runtime);
         let context = Context::full(&runtime)?;
         return context.with(|ctx| f(ctx, true));
     }
@@ -2748,6 +2866,7 @@ fn with_reusable_context<T>(
         None => {
             let runtime = Runtime::new()?;
             runtime.set_max_stack_size(JS_MAX_STACK_SIZE);
+            install_interrupt_handler(&runtime);
             let context = Context::full(&runtime)?;
             JS_CONTEXT.with(|cell| {
                 *cell.borrow_mut() = Some(CachedJsContext {
@@ -2760,10 +2879,21 @@ fn with_reusable_context<T>(
     };
 
     let result = context.with(|ctx| f(ctx, initialize));
-    if result.is_err() { JS_CONTEXT.with(|cell| { *cell.borrow_mut() = None; }); }
-    result
+    if result.is_err() {
+        JS_CONTEXT.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+    match result {
+        Err(error) => Err(stop_reason().unwrap_or(error)),
+        other => other,
+    }
 }
 
+// 参数多是有意的: 这是脚本执行的内核, 每个参数对应一种注入方式
+// (source 绑定 / 页面 key / 分页 / 额外绑定 / 二进制输入)。拆成 builder 结构体
+// 只会把同一个调用点写得更长, 而调用点有 7 个。
+#[allow(clippy::too_many_arguments)]
 fn eval_js_inner_with_source(
     script: &str,
     input: Option<&str>,
@@ -2782,14 +2912,14 @@ fn eval_js_inner_with_source(
 ) -> anyhow::Result<String> {
     let shared_js = active_js_lib_script();
     let source_info = active_source();
-    let source_url = source_info
-        .url
-        .clone()
-        .trim()
-        .is_empty()
-        .then(|| source_key.unwrap_or("").to_string())
-        .unwrap_or_else(|| source_info.url.clone());
-    let mut book_ctx = ACTIVE_BOOK_CTX.with(|cell| cell.borrow().clone()).unwrap_or_default();
+    let source_url = if source_info.url.clone().trim().is_empty() {
+        source_key.unwrap_or("").to_string()
+    } else {
+        source_info.url.clone()
+    };
+    let mut book_ctx = ACTIVE_BOOK_CTX
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_default();
     // legado 的目录/正文规则可能直接读 `book.bookUrl`。部分调用路径（如纯 JS 规则）
     // 只通过 thread-local 登记了书籍 URL，这里在 book 上下文缺 bookUrl 时补齐。
     let has_book_url = book_ctx
@@ -2808,7 +2938,11 @@ fn eval_js_inner_with_source(
 
     // 复用键必须带上书源: 不同书源(尤其都没有 jsLib 时)不能共用同一个上下文,
     // 否则规则脚本声明的全局变量会互相可见。同一书源的连续章节仍能命中复用。
-    let identity = source_info.http.as_ref().map(|http| http.session.identity.as_str()).unwrap_or(&source_info.url);
+    let identity = source_info
+        .http
+        .as_ref()
+        .map(|http| http.session.identity.as_str())
+        .unwrap_or(&source_info.url);
     let lib_key = format!("{}\u{1}{}", identity, md5_hex(&shared_js));
     with_reusable_context(&lib_key, &shared_js, |ctx, initialize| {
         let globals = ctx.globals();
@@ -3734,23 +3868,71 @@ macro_rules! block_crypt {
             buf.resize(data.len() + block, 0);
             let len = data.len();
             let out: Result<&[u8], _> = match ($mode, $padding) {
-                (CipherMode::Cbc, CipherPadding::Pkcs7) => cbc::Encryptor::<$cipher>::new_from_slices(key, &iv).map_err(|e| bad(&e))?.encrypt_padded_mut::<Pkcs7>(&mut buf, len),
-                (CipherMode::Cbc, CipherPadding::None) => cbc::Encryptor::<$cipher>::new_from_slices(key, &iv).map_err(|e| bad(&e))?.encrypt_padded_mut::<NoPadding>(&mut buf, len),
-                (CipherMode::Cbc, CipherPadding::Zero) => cbc::Encryptor::<$cipher>::new_from_slices(key, &iv).map_err(|e| bad(&e))?.encrypt_padded_mut::<ZeroPadding>(&mut buf, len),
-                (CipherMode::Ecb, CipherPadding::Pkcs7) => ecb::Encryptor::<$cipher>::new_from_slice(key).map_err(|e| bad(&e))?.encrypt_padded_mut::<Pkcs7>(&mut buf, len),
-                (CipherMode::Ecb, CipherPadding::None) => ecb::Encryptor::<$cipher>::new_from_slice(key).map_err(|e| bad(&e))?.encrypt_padded_mut::<NoPadding>(&mut buf, len),
-                (CipherMode::Ecb, CipherPadding::Zero) => ecb::Encryptor::<$cipher>::new_from_slice(key).map_err(|e| bad(&e))?.encrypt_padded_mut::<ZeroPadding>(&mut buf, len),
+                (CipherMode::Cbc, CipherPadding::Pkcs7) => {
+                    cbc::Encryptor::<$cipher>::new_from_slices(key, &iv)
+                        .map_err(|e| bad(&e))?
+                        .encrypt_padded_mut::<Pkcs7>(&mut buf, len)
+                }
+                (CipherMode::Cbc, CipherPadding::None) => {
+                    cbc::Encryptor::<$cipher>::new_from_slices(key, &iv)
+                        .map_err(|e| bad(&e))?
+                        .encrypt_padded_mut::<NoPadding>(&mut buf, len)
+                }
+                (CipherMode::Cbc, CipherPadding::Zero) => {
+                    cbc::Encryptor::<$cipher>::new_from_slices(key, &iv)
+                        .map_err(|e| bad(&e))?
+                        .encrypt_padded_mut::<ZeroPadding>(&mut buf, len)
+                }
+                (CipherMode::Ecb, CipherPadding::Pkcs7) => {
+                    ecb::Encryptor::<$cipher>::new_from_slice(key)
+                        .map_err(|e| bad(&e))?
+                        .encrypt_padded_mut::<Pkcs7>(&mut buf, len)
+                }
+                (CipherMode::Ecb, CipherPadding::None) => {
+                    ecb::Encryptor::<$cipher>::new_from_slice(key)
+                        .map_err(|e| bad(&e))?
+                        .encrypt_padded_mut::<NoPadding>(&mut buf, len)
+                }
+                (CipherMode::Ecb, CipherPadding::Zero) => {
+                    ecb::Encryptor::<$cipher>::new_from_slice(key)
+                        .map_err(|e| bad(&e))?
+                        .encrypt_padded_mut::<ZeroPadding>(&mut buf, len)
+                }
             };
             out.map(|s| s.to_vec()).map_err(|e| bad(&e))
         } else {
             let mut buf = data.to_vec();
             let out: Result<&[u8], _> = match ($mode, $padding) {
-                (CipherMode::Cbc, CipherPadding::Pkcs7) => cbc::Decryptor::<$cipher>::new_from_slices(key, &iv).map_err(|e| bad(&e))?.decrypt_padded_mut::<Pkcs7>(&mut buf),
-                (CipherMode::Cbc, CipherPadding::None) => cbc::Decryptor::<$cipher>::new_from_slices(key, &iv).map_err(|e| bad(&e))?.decrypt_padded_mut::<NoPadding>(&mut buf),
-                (CipherMode::Cbc, CipherPadding::Zero) => cbc::Decryptor::<$cipher>::new_from_slices(key, &iv).map_err(|e| bad(&e))?.decrypt_padded_mut::<ZeroPadding>(&mut buf),
-                (CipherMode::Ecb, CipherPadding::Pkcs7) => ecb::Decryptor::<$cipher>::new_from_slice(key).map_err(|e| bad(&e))?.decrypt_padded_mut::<Pkcs7>(&mut buf),
-                (CipherMode::Ecb, CipherPadding::None) => ecb::Decryptor::<$cipher>::new_from_slice(key).map_err(|e| bad(&e))?.decrypt_padded_mut::<NoPadding>(&mut buf),
-                (CipherMode::Ecb, CipherPadding::Zero) => ecb::Decryptor::<$cipher>::new_from_slice(key).map_err(|e| bad(&e))?.decrypt_padded_mut::<ZeroPadding>(&mut buf),
+                (CipherMode::Cbc, CipherPadding::Pkcs7) => {
+                    cbc::Decryptor::<$cipher>::new_from_slices(key, &iv)
+                        .map_err(|e| bad(&e))?
+                        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+                }
+                (CipherMode::Cbc, CipherPadding::None) => {
+                    cbc::Decryptor::<$cipher>::new_from_slices(key, &iv)
+                        .map_err(|e| bad(&e))?
+                        .decrypt_padded_mut::<NoPadding>(&mut buf)
+                }
+                (CipherMode::Cbc, CipherPadding::Zero) => {
+                    cbc::Decryptor::<$cipher>::new_from_slices(key, &iv)
+                        .map_err(|e| bad(&e))?
+                        .decrypt_padded_mut::<ZeroPadding>(&mut buf)
+                }
+                (CipherMode::Ecb, CipherPadding::Pkcs7) => {
+                    ecb::Decryptor::<$cipher>::new_from_slice(key)
+                        .map_err(|e| bad(&e))?
+                        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+                }
+                (CipherMode::Ecb, CipherPadding::None) => {
+                    ecb::Decryptor::<$cipher>::new_from_slice(key)
+                        .map_err(|e| bad(&e))?
+                        .decrypt_padded_mut::<NoPadding>(&mut buf)
+                }
+                (CipherMode::Ecb, CipherPadding::Zero) => {
+                    ecb::Decryptor::<$cipher>::new_from_slice(key)
+                        .map_err(|e| bad(&e))?
+                        .decrypt_padded_mut::<ZeroPadding>(&mut buf)
+                }
             };
             out.map(|s| s.to_vec()).map_err(|e| bad(&e))
         }
@@ -3910,11 +4092,18 @@ pub(super) fn symmetric_crypt(
     iv: &[u8],
     data: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
-    let mut parts = transformation.split('/').map(|p| p.trim().to_ascii_uppercase());
+    let mut parts = transformation
+        .split('/')
+        .map(|p| p.trim().to_ascii_uppercase());
     let algorithm = parts.next().unwrap_or_default();
     // GCM 是 AEAD：不能走 `block_crypt!` 那套分组模式（无填充、需要认证标签），
     // 单独分派。书源里 `AES/GCM/NoPadding` 用来解密接口响应与生成签名。
-    if parts.clone().next().map(|p| p.eq_ignore_ascii_case("GCM")).unwrap_or(false) {
+    if parts
+        .clone()
+        .next()
+        .map(|p| p.eq_ignore_ascii_case("GCM"))
+        .unwrap_or(false)
+    {
         if !algorithm.eq_ignore_ascii_case("AES") {
             bail_config!("GCM 目前只支持 AES，收到 {algorithm}");
         }
@@ -3937,7 +4126,15 @@ pub(super) fn symmetric_crypt(
             32 => block_crypt!(aes::Aes256, encrypt, mode, padding, key, iv, data),
             n => bail_config!("AES 密钥长度无效: {n}"),
         },
-        "DES" => block_crypt!(des::Des, encrypt, mode, padding, &key[..key.len().min(8)], iv, data),
+        "DES" => block_crypt!(
+            des::Des,
+            encrypt,
+            mode,
+            padding,
+            &key[..key.len().min(8)],
+            iv,
+            data
+        ),
         "DESEDE" | "TRIPLEDES" | "3DES" => {
             // 16 字节密钥按 K1K2K1 扩展(Java 需显式 24 字节, 这里宽松处理)
             let mut key24 = key.to_vec();
@@ -3983,7 +4180,11 @@ fn symmetric_codec_with_flags(
 ) -> anyhow::Result<String> {
     let engine = &base64::engine::general_purpose::STANDARD;
     let as_bytes = |value: &str, is_bytes: bool| -> Vec<u8> {
-        if is_bytes { latin1_bytes(value) } else { value.as_bytes().to_vec() }
+        if is_bytes {
+            latin1_bytes(value)
+        } else {
+            value.as_bytes().to_vec()
+        }
     };
     let key_bytes = as_bytes(key, flags & 1 != 0);
     let iv_bytes = as_bytes(iv, flags & 2 != 0);
@@ -4005,7 +4206,7 @@ fn symmetric_codec_with_flags(
     // 其余格式（base64/hex/auto）都是文本编码，仍按文本处理。
     let trimmed = data.trim();
     let is_hex = !trimmed.is_empty()
-        && trimmed.len() % 2 == 0
+        && trimmed.len().is_multiple_of(2)
         && trimmed.chars().all(|c| c.is_ascii_hexdigit());
     let bytes = match format {
         "raw" => latin1_bytes(data),
@@ -4045,8 +4246,8 @@ pub(crate) fn decode_base64_lenient(input: &str) -> Result<Vec<u8>, base64::Deco
 /// （JS 侧用 `String.fromCharCode(byte & 0xff)` 构造，因此正常情况下必然 ≤U+00FF）。
 ///
 /// 只有确认入参是字节序列时才可调用（JS 侧 `__sym` 的 flags 位、`raw` 解密格式、
-/// `__http_bytes` 的 body）。普通文本 key 走 `str::as_bytes`（UTF-8）——
-/// 早先按「字符是否全 ≤0xFF」猜测，会把 `café` 这类文本 key 误当成字节序列。
+/// `__http_bytes` 的 body）。普通文本 key 走 `str::as_bytes`（UTF-8）：
+/// 「字符是否全 ≤0xFF」不能用来判断，`café` 这类文本会被误认成字节序列。
 ///
 /// 对超出范围的字符按低 8 位取值（与 JS 侧 `charCodeAt(i) & 0xff` 一致），
 /// 不做断言/panic：入参来自书源脚本，不能让异常输入中断求值。
@@ -4113,17 +4314,7 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
     if current == script {
         return Err(failure);
     }
-    match eval_script_raw(ctx.clone(), &current) {
-        Ok(value) => Ok(value),
-        // 补丁改对了、但脚本运行期才出错时, 真实原因在重试错误里; 返回首次的
-        // "Unexpected token '=>'" 会把 "BOOM" 这类信息整个丢掉。
-        //
-        // 也不能按错误文案区分「解析失败」与「运行期失败」: JSON.parse 之类的
-        // 运行期异常同样带 "expecting ..." 文本, 关键词判定会认错。
-        // 只要补丁确实改写了脚本, 重试错误就是针对「实际会执行的代码」的报错,
-        // 直接透传最诚实。
-        Err(retry) => Err(retry),
-    }
+    eval_script_raw(ctx.clone(), &current)
 }
 
 /// 判断脚本是否存在**语法**错误(而不是运行期错误)。
@@ -4141,9 +4332,14 @@ fn eval_script_raw<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result
     // legado(Rhino) 是非严格模式; 混淆脚本常依赖 sloppy 语义(如顶层 this 指向全局)
     let mut options = EvalOptions::default();
     options.strict = false;
+    let _deadline = ScriptDeadline::start();
     match ctx.eval_with_options(script, options) {
         Ok(v) => Ok(v),
         Err(e) => {
+            // 中断(取消 / 超时)不是脚本的语法或逻辑错误, 先按原因返回。
+            if let Some(reason) = stop_reason() {
+                return Err(reason);
+            }
             let caught = ctx.catch();
             if let Some(exception) = caught.as_exception() {
                 let message = exception.message().unwrap_or_default();
@@ -4152,7 +4348,10 @@ fn eval_script_raw<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result
             }
             if !caught.is_undefined() && !caught.is_null() {
                 if let Some(message) = caught.as_string() {
-                    return Err(anyhow::anyhow!("JS 异常: {}", message.to_string().unwrap_or_default()));
+                    return Err(anyhow::anyhow!(
+                        "JS 异常: {}",
+                        message.to_string().unwrap_or_default()
+                    ));
                 }
                 return Err(anyhow::anyhow!("JS 异常: {caught:?}"));
             }
@@ -4406,7 +4605,11 @@ fn patch_let_redeclared_params(script: &str) -> Option<String> {
 
         // `function name(params) {` —— 记下形参名，等遇到 `{` 时开作用域。
         let rest: String = chars[i..chars.len().min(i + 8)].iter().collect();
-        if rest.starts_with("function") && !out.last().is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$') {
+        if rest.starts_with("function")
+            && !out
+                .last()
+                .is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$')
+        {
             for ch in "function".chars() {
                 out.push(ch);
             }
@@ -4416,7 +4619,8 @@ fn patch_let_redeclared_params(script: &str) -> Option<String> {
                 out.push(chars[i]);
                 i += 1;
             }
-            if i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
+            if i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
                 let (_, next) = read_ident(&chars, i);
                 while i < next {
                     out.push(chars[i]);
@@ -4428,7 +4632,8 @@ fn patch_let_redeclared_params(script: &str) -> Option<String> {
                 i += 1;
             }
             if i < chars.len() && chars[i] == '(' {
-                let mut params: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut params: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 let mut level = 0i32;
                 while i < chars.len() {
                     let ch = chars[i];
@@ -4483,10 +4688,18 @@ fn patch_let_redeclared_params(script: &str) -> Option<String> {
         }
 
         // `let x =` / `const x =`：若 x 在当前函数形参里，换成 `var`。
-        let is_let = rest.starts_with("let") && !chars.get(i + 3).is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$');
-        let is_const = rest.starts_with("const") && !chars.get(i + 5).is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$');
+        let is_let = rest.starts_with("let")
+            && !chars
+                .get(i + 3)
+                .is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$');
+        let is_const = rest.starts_with("const")
+            && !chars
+                .get(i + 5)
+                .is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$');
         if (is_let || is_const)
-            && !out.last().is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$' || *p == '.')
+            && !out
+                .last()
+                .is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '$' || *p == '.')
         {
             let kw_len = if is_let { 3 } else { 5 };
             // 跳过关键字与空白，读变量名。
@@ -4613,24 +4826,28 @@ fn active_js_lib_script() -> String {
         return String::new();
     };
     let cache_key = md5_hex(&js_lib);
-    if let Some((cached, retry_at)) = JS_LIB_CACHE
+    if let Some(cached) = JS_LIB_CACHE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(|error| error.into_inner())
         .get(&cache_key)
-        .cloned()
+        .filter(|cached| cached.retry_at.is_none_or(|at| Instant::now() < at))
     {
-        if retry_at.map_or(true, |at| Instant::now() < at) {
-            return cached;
-        }
+        return cached.source.clone();
     }
 
-    let (compiled, complete) = compile_js_lib(&js_lib);
+    let (source, complete) = compile_js_lib(&js_lib);
     let retry_at = (!complete).then(|| Instant::now() + JS_LIB_RETRY_AFTER);
     JS_LIB_CACHE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(cache_key, (compiled.clone(), retry_at));
-    compiled
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            cache_key,
+            CachedJsLib {
+                source: source.clone(),
+                retry_at,
+            },
+        );
+    source
 }
 
 /// 组装 jsLib。JSON 对象形式 `{"name": "https://...js"}` 按 legado 逐个下载 URL 值;
@@ -4657,9 +4874,11 @@ fn compile_js_lib(js_lib: &str) -> (String, bool) {
 }
 
 fn js_lib_cache_path(url: &str) -> Option<PathBuf> {
-    JS_STORAGE_DIR
-        .get()
-        .map(|dir| dir.join("cache").join("jslib").join(format!("{}.js", md5_hex(url))))
+    JS_STORAGE_DIR.get().map(|dir| {
+        dir.join("cache")
+            .join("jslib")
+            .join(format!("{}.js", md5_hex(url)))
+    })
 }
 
 /// URL 条目: 优先读磁盘缓存(与 legado 相同, 永不过期; 修改 jsLib 后按新 URL 重新下载),
@@ -4775,11 +4994,13 @@ fn java_digest_base64(input: &str, algorithm: &str) -> anyhow::Result<String> {
 /// 直接走 `java_hmac_hex`（`&str`）会先把字节转文本再取 UTF-8 字节，非 UTF-8
 /// 的二进制签名数据会被改写。
 ///
-/// 算法名归一化与 `java.HMacHex` / `HMacBase64` 共用 [`normalize_digest_name`]：
-/// 两条 HMAC 路径曾经分叉 —— 这条剥了 `HMAC` 前缀、那条没剥，于是
-/// `Packages.javax.crypto.Mac("HmacSHA1")` 正常而 `java.HMacHex("HmacSHA1")`
-/// 静默返回空串（issue #29）。改这里时**不要**再自己解析算法名。
-pub(crate) fn java_hmac_hex_bytes(key: &[u8], algorithm: &str, data: &[u8]) -> anyhow::Result<String> {
+/// 算法名归一化与 `java.HMacHex` / `HMacBase64` 共用 [`normalize_digest_name`]，
+/// 不要另写一份：前缀处理不一致会让其中一条路径静默返回空串。
+pub(crate) fn java_hmac_hex_bytes(
+    key: &[u8],
+    algorithm: &str,
+    data: &[u8],
+) -> anyhow::Result<String> {
     // 必须**直接用字节**算：早期实现把 key/data 按 ISO-8859-1 转成 `&str` 再取
     // UTF-8 字节，等于把每个高位字节膨胀成两字节，摘要完全对不上 —— 而书源的
     // 密钥常由 `SecureRandom` 生成，非 UTF-8 是常态。
@@ -4815,9 +5036,8 @@ fn java_hmac_base64(input: &str, algorithm: &str, key: &str) -> anyhow::Result<S
 /// 通用 HMAC 计算, 按算法名分发到对应摘要类型。
 ///
 /// 未知算法**返回错误**而不是空串：legado 的 `Mac.getInstance(未知名)` 抛
-/// `NoSuchAlgorithmException`，书源调试面板会直接指出算法名写错。早先这里
-/// `unwrap_or_default()` 静默给 `""`，签名为空但流程照走，服务端只回
-/// `Invalid Signature` —— 排查成本极高（issue #29）。
+/// `NoSuchAlgorithmException`，书源调试面板能直接指出算法名写错；返回空串
+/// 只会让服务端回 `Invalid Signature`，无从定位。
 fn java_hmac(input: &str, algorithm: &str, key: &str, hex_out: bool) -> anyhow::Result<String> {
     let key_bytes = key.as_bytes();
     let name = normalize_digest_name(algorithm);
@@ -5019,7 +5239,8 @@ const T2S_PAIRS: &str = concat!(
 fn t2s_map() -> &'static HashMap<char, char> {
     static MAP: OnceLock<HashMap<char, char>> = OnceLock::new();
     MAP.get_or_init(|| {
-        T2S_PAIRS.chars()
+        T2S_PAIRS
+            .chars()
             .collect::<Vec<char>>()
             .chunks(2)
             .filter(|pair| pair.len() == 2 && pair[0] != pair[1])
@@ -5038,10 +5259,14 @@ fn java_t2s(input: &str) -> String {
 fn java_s2t(input: &str) -> String {
     static REVERSE: OnceLock<HashMap<char, char>> = OnceLock::new();
     let reverse = REVERSE.get_or_init(|| t2s_map().iter().map(|(t, s)| (*s, *t)).collect());
-    input.chars().map(|c| *reverse.get(&c).unwrap_or(&c)).collect()
+    input
+        .chars()
+        .map(|c| *reverse.get(&c).unwrap_or(&c))
+        .collect()
 }
 /// legado `java.htmlFormat(str)`: 解码 HTML 实体为纯文本
-fn java_html_format(input: &str) -> String {    input
+fn java_html_format(input: &str) -> String {
+    input
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -5052,15 +5277,17 @@ fn java_html_format(input: &str) -> String {    input
 
 /// legado `java.toNumChapter(s)`: 把「第N章/第N话」等还原为数字编号
 fn java_to_num_chapter(input: &str) -> String {
-    static RE: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"(?i)(第?\s*([0-9０-９]{1,9})\s*[章卷话集回])").unwrap()
-    });
+    static RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?i)(第?\s*([0-9０-９]{1,9})\s*[章卷话集回])").unwrap());
     let re = &*RE;
     if let Some(caps) = re.captures(input) {
         if let Some(num) = caps.get(2) {
             // 全角数字转半角
             let mut n: String = num.as_str().to_string();
-            let full: Vec<(char, char)> = "０１２３４５６７８９".chars().zip("0123456789".chars()).collect();
+            let full: Vec<(char, char)> = "０１２３４５６７８９"
+                .chars()
+                .zip("0123456789".chars())
+                .collect();
             for (f, h) in full {
                 n = n.replace(f, &h.to_string());
             }
@@ -5086,7 +5313,10 @@ fn java_time_format_utc(timestamp: i64, format: &str, sh: i64) -> String {
     };
     // sh 是 UTC 偏移小时数, legado 默认东八区(8)
     let offset_secs = sh * 3600;
-    let dt = Utc.timestamp_opt(secs, 0).single().map(|t| t + chrono::Duration::seconds(offset_secs));
+    let dt = Utc
+        .timestamp_opt(secs, 0)
+        .single()
+        .map(|t| t + chrono::Duration::seconds(offset_secs));
     match dt {
         Some(d) => d.format(&fmt).to_string(),
         None => String::new(),
@@ -5188,7 +5418,16 @@ fn js_request(
     default_headers: &[(String, String)],
     options: &JsonValue,
 ) -> JsonValue {
-    js_request_with_bytes(method, url, body, None, headers, default_headers, options, false)
+    js_request_with_bytes(
+        method,
+        url,
+        body,
+        None,
+        headers,
+        default_headers,
+        options,
+        false,
+    )
 }
 
 fn latin1_bytes_string(bytes: &[u8]) -> String {
@@ -5219,7 +5458,16 @@ fn js_http_bytes(
 ) -> JsonValue {
     let headers = serde_json::from_str::<JsonValue>(headers).unwrap_or(JsonValue::Null);
     let body = (!body.is_empty()).then(|| latin1_bytes(body));
-    js_request_with_bytes(method, url, None, body, &headers, default_headers, &JsonValue::Null, true)
+    js_request_with_bytes(
+        method,
+        url,
+        None,
+        body,
+        &headers,
+        default_headers,
+        &JsonValue::Null,
+        true,
+    )
 }
 
 /// 解析 JS 网络请求的重试次数。
@@ -5228,10 +5476,8 @@ fn js_http_bytes(
 ///
 /// - 文本路径(`java.ajax`/`java.get`)沿用 legado 的宽松语义, 保持 2 次重试;
 /// - 字节路径走的是 `Packages.java.net.URL(...).openConnection()` —— 真实 Java
-///   的 HttpURLConnection **不会自动重试**, 书源脚本自己负责重试。早先这里同样
-///   默认 2 次, 而脚本设的 connectTimeout/readTimeout 在本层是空实现, 于是单个
-///   不可达地址要串行挂满 3 个宿主超时。某类带段评的书源首次打开要注册两台设备,
-///   最坏 ≈90s, 用户看到的就是「点了很久、像是打不开」。按 Java 语义退回单次。
+///   的 HttpURLConnection **不会自动重试**, 书源脚本自己负责。本层的
+///   connectTimeout/readTimeout 是空实现, 多一次重试就多一份宿主超时的等待。
 fn js_request_retry(options: &JsonValue, raw_response: bool) -> usize {
     let default_retry = if raw_response { 0 } else { 2 };
     options["retry"].as_u64().unwrap_or(default_retry).min(5) as usize
@@ -5250,7 +5496,11 @@ const PANEL_REQUEST_TIMEOUT_SECS: u64 = 9;
 /// 面板里做的下一次真实请求(如翻页拉段评)要排在几十张图片后面。实测该类书源
 /// (`concurrentRate=1/1000`) + 24 个并发头像会把一次段评请求从 ~0.9s 拖到 24.8s。
 fn js_concurrent_rate(panel_request: bool, source_rate: Option<String>) -> Option<String> {
-    if panel_request { None } else { source_rate }
+    if panel_request {
+        None
+    } else {
+        source_rate
+    }
 }
 
 /// 面板请求的宿主超时: 取**全局请求超时**与 [`PANEL_REQUEST_TIMEOUT_SECS`] 的较小值。
@@ -5286,9 +5536,12 @@ fn js_request_with_bytes(
         return json!({ "body": "", "code": 0, "url": "", "headers": {}, "call_time": 0 });
     }
     let method = match method.to_ascii_uppercase().as_str() {
-        "POST" => HttpMethod::POST, "HEAD" => HttpMethod::HEAD,
-        "PUT" => HttpMethod::PUT, "PATCH" => HttpMethod::PATCH,
-        "DELETE" => HttpMethod::DELETE, _ => HttpMethod::GET,
+        "POST" => HttpMethod::POST,
+        "HEAD" => HttpMethod::HEAD,
+        "PUT" => HttpMethod::PUT,
+        "PATCH" => HttpMethod::PATCH,
+        "DELETE" => HttpMethod::DELETE,
+        _ => HttpMethod::GET,
     };
     let mut merged: Vec<(String, String)> = default_headers.to_vec();
     for (key, value) in login_headers() {
@@ -5306,19 +5559,31 @@ fn js_request_with_bytes(
             merged.push((key.clone(), value));
         }
     }
-    if !merged.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+    if !merged
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+    {
         merged.push(("User-Agent".to_string(), DEFAULT_JS_USER_AGENT.to_string()));
     }
     let source = active_source();
     // `panel` 由面板桥(见 `run_panel_request_inner`)注入。
-    let panel_request = options.get("panel").and_then(|v| v.as_bool()).unwrap_or(false);
+    let panel_request = options
+        .get("panel")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // 面板请求(见 `js_panel_*`)不参与书源的并发限速: 面板首屏会给每条段评拉头像,
     // 该类书源 concurrentRate=1/1000 时这些静态资源会排满限速队列, 用户再点下一段
     // 段评就得排在几十个头像请求后面(实测 24 个并发头像把一次段评请求拖到 24.8s)。
     let concurrent_rate = js_concurrent_rate(panel_request, source.concurrent_rate.clone());
-    let http = source.http.map(Ok).unwrap_or_else(|| source_http_context(&source.url));
+    let http = source
+        .http
+        .map(Ok)
+        .unwrap_or_else(|| source_http_context(&source.url));
     let request_url = crate::crawler::url_analyzer::absolute_url(&source.url, &url);
-    let proxy = merged.iter().find(|(key, _)| key.eq_ignore_ascii_case("proxy")).map(|(_, value)| value.clone());
+    let proxy = merged
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("proxy"))
+        .map(|(_, value)| value.clone());
     merged.retain(|(key, _)| !key.eq_ignore_ascii_case("proxy"));
     // 默认跟随重定向; `java.get/head/post` 显式关掉(legado
     // `Jsoup.connect(...).followRedirects(false)`, 见 `js_http_with_redirect`)。
@@ -5329,11 +5594,26 @@ fn js_request_with_bytes(
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
     let spec = RequestSpec {
-        url: request_url, method, headers: merged, body,
+        url: request_url,
+        method,
+        headers: merged,
+        body,
         body_bytes,
-        retry: if panel_request { js_panel_retry(options) } else { js_request_retry(options, raw_response) },
+        retry: if panel_request {
+            js_panel_retry(options)
+        } else {
+            js_request_retry(options, raw_response)
+        },
         charset: options["charset"].as_str().map(str::to_string),
-        response_type: options.get("type").filter(|value| !value.is_null()).map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())),
+        response_type: options
+            .get("type")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            }),
         ..Default::default()
     };
     let outcome = run_blocking_http(move || -> anyhow::Result<JsonValue> {
@@ -5344,42 +5624,89 @@ fn js_request_with_bytes(
         // 带自定义 `proxy` 头的请求要另建 client(书源 client 的代理是固定的)。
         // 注意: 面板请求的短超时不是靠这里, 而是下面给 `spec.timeout` 做 per-request
         // 覆盖 —— 它优先于 client 自身的超时, 且不需要重建连接池。
-        let client = if let Some(proxy) = proxy.as_deref().filter(|v| Some(*v) != http.proxy.as_deref()) {
+        let client = if let Some(proxy) = proxy
+            .as_deref()
+            .filter(|v| Some(*v) != http.proxy.as_deref())
+        {
             if raw_response {
-                crate::crawler::http_client::build_raw_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+                crate::crawler::http_client::build_raw_source_client(
+                    http.timeout_secs,
+                    Some(proxy),
+                    http.session.cookies.clone(),
+                )?
             } else if !follow_redirects {
-                crate::crawler::http_client::build_source_client_no_redirect(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+                crate::crawler::http_client::build_source_client_no_redirect(
+                    http.timeout_secs,
+                    Some(proxy),
+                    http.session.cookies.clone(),
+                )?
             } else {
-                crate::crawler::http_client::build_source_client(http.timeout_secs, Some(proxy), http.session.cookies.clone())?
+                crate::crawler::http_client::build_source_client(
+                    http.timeout_secs,
+                    Some(proxy),
+                    http.session.cookies.clone(),
+                )?
             }
         } else if raw_response {
-            crate::crawler::http_client::build_raw_source_client(http.timeout_secs, http.proxy.as_deref(), http.session.cookies.clone())?
+            crate::crawler::http_client::build_raw_source_client(
+                http.timeout_secs,
+                http.proxy.as_deref(),
+                http.session.cookies.clone(),
+            )?
         } else if !follow_redirects {
             http.client_no_redirect.clone()
-        } else { http.client };
+        } else {
+            http.client
+        };
         // 面板请求(浏览器 `fetch` 过桥的那些)只压单次超时, 不重建 client:
         // 面板首屏会并发几十个头像, 每次新建 reqwest::Client 就得重做一轮 TLS
         // 握手/连接池, 反而更慢。`timeout` 是 per-request 覆盖, 连接池照旧复用。
         // `follow_redirects` 交由 fetcher 执行：它会在每一跳按新地址重建 `Host`，
         // 换域跳转才不会带着旧域的 `Host` 打转（详见 `fetcher::fetch_inner`）。
-        let spec = RequestSpec { follow_redirects, ..spec };
+        let spec = RequestSpec {
+            follow_redirects,
+            ..spec
+        };
         let spec = if panel_request {
             let timeout = std::time::Duration::from_secs(js_panel_timeout_secs(http.timeout_secs));
-            RequestSpec { timeout: Some(timeout), ..spec }
-        } else { spec };
-        let response = if raw_response {
-            JS_HTTP_RUNTIME.block_on(http.session.request_raw(&client, spec, concurrent_rate.as_deref()))?
+            RequestSpec {
+                timeout: Some(timeout),
+                ..spec
+            }
         } else {
-            JS_HTTP_RUNTIME.block_on(http.session.request(&client, spec, concurrent_rate.as_deref()))?
+            spec
+        };
+        let response = if raw_response {
+            JS_HTTP_RUNTIME.block_on(http.session.request_raw(
+                &client,
+                spec,
+                concurrent_rate.as_deref(),
+            ))?
+        } else {
+            JS_HTTP_RUNTIME.block_on(http.session.request(
+                &client,
+                spec,
+                concurrent_rate.as_deref(),
+            ))?
         };
         // `StrResponse.callTime()` 的耗时口径：legado 在 `getStrResponse` 里包的是
         // **整个请求**（建连 + 读完 body），见 `AnalyzeUrl.kt` 的
         // `connectionTime = System.currentTimeMillis() - startTime`。
         // 这里同样包住 `session.request*` 的整个调用，而不是只量建连。
         let elapsed_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u64;
-        let headers = response.headers.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), json!(v))).collect::<serde_json::Map<_, _>>();
-        let body = if raw_response { latin1_bytes_string(&response.raw_body) } else { response.body };
-        Ok(json!({"body":body, "code":response.status, "url":response.url, "headers":headers, "call_time":elapsed_ms}))
+        let headers = response
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), json!(v)))
+            .collect::<serde_json::Map<_, _>>();
+        let body = if raw_response {
+            latin1_bytes_string(&response.raw_body)
+        } else {
+            response.body
+        };
+        Ok(
+            json!({"body":body, "code":response.status, "url":response.url, "headers":headers, "call_time":elapsed_ms}),
+        )
     });
     let value = outcome.unwrap_or_else(|e| {
         if panel_request {
@@ -5413,10 +5740,22 @@ fn js_request_with_bytes(
 /// 超时压到 [`PANEL_REQUEST_TIMEOUT_SECS`]。面板首屏会给每条段评拉头像, 这些
 /// 第三方静态资源连不通是常态, 不该占着书源限速队列, 也不该按书源长超时干等;
 /// 手机端同样的请求是 WebView 直连, 本来就不经过书源限速器。
-fn js_panel_fetch(method: &str, url: &str, body: &str, default_headers: &[(String, String)]) -> JsonValue {
+fn js_panel_fetch(
+    method: &str,
+    url: &str,
+    body: &str,
+    default_headers: &[(String, String)],
+) -> JsonValue {
     let options = with_panel_flag(json!({}));
     let body = (!body.is_empty() || method.eq_ignore_ascii_case("POST")).then(|| body.to_string());
-    js_request(method, url, body, &JsonValue::Null, default_headers, &options)
+    js_request(
+        method,
+        url,
+        body,
+        &JsonValue::Null,
+        default_headers,
+        &options,
+    )
 }
 
 /// 给请求选项打上 `panel` 标记。面板桥构造选项时必须走这里, 否则限速/超时/
@@ -5427,7 +5766,6 @@ fn with_panel_flag(mut options: JsonValue) -> JsonValue {
     }
     options
 }
-
 
 fn js_http(
     method: &str,
@@ -5482,7 +5820,14 @@ fn js_connect(spec: &str, headers: &str, default_headers: &[(String, String)]) -
     if let Some(map) = options.get("headers").and_then(|v| v.as_object()) {
         merged.extend(map.clone());
     }
-    js_request(&method, url, body, &JsonValue::Object(merged), default_headers, &options)
+    js_request(
+        &method,
+        url,
+        body,
+        &JsonValue::Object(merged),
+        default_headers,
+        &options,
+    )
 }
 
 /// `__connect_all(specsJson, headers)`：`ajaxAll` 的宿主实现。
@@ -5507,9 +5852,11 @@ fn js_connect_all(specs: &str, headers: &str, default_headers: &[(String, String
             .collect();
         handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_else(|_| {
-                json!({"body": "", "code": 0, "url": "", "headers": {}, "call_time": 0})
-            }))
+            .map(|handle| {
+                handle.join().unwrap_or_else(
+                    |_| json!({"body": "", "code": 0, "url": "", "headers": {}, "call_time": 0}),
+                )
+            })
             .collect()
     });
     JsonValue::Array(results).to_string()
@@ -5540,14 +5887,12 @@ pub fn remove_book_variables(book_url: &str, chapter_urls: &[String]) {
     }
     store_write(|map| {
         map.retain(|key, _| {
-            let book_scoped = key
-                .strip_prefix("bv:")
-                .is_some_and(|suffix| {
-                    suffix == book_url
-                        || suffix
-                            .strip_prefix(book_url)
-                            .is_some_and(|rest| rest.starts_with(':'))
-                });
+            let book_scoped = key.strip_prefix("bv:").is_some_and(|suffix| {
+                suffix == book_url
+                    || suffix
+                        .strip_prefix(book_url)
+                        .is_some_and(|rest| rest.starts_with(':'))
+            });
             let read_config_scoped = key.strip_prefix("brc:").is_some_and(|suffix| {
                 suffix
                     .strip_suffix(book_url)
@@ -5582,18 +5927,30 @@ pub fn run_panel_request(
     payload: &JsonValue,
 ) -> anyhow::Result<String> {
     run_panel_fetch(source, base_url, action, payload).map(|response| {
-        response.get("body").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+        response
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
     })
 }
 
 pub fn run_panel_fetch(
-    source: &BookSource, base_url: &str, action: &str, payload: &JsonValue,
+    source: &BookSource,
+    base_url: &str,
+    action: &str,
+    payload: &JsonValue,
 ) -> anyhow::Result<JsonValue> {
-    with_source(source, || run_panel_request_inner(source, base_url, action, payload))
+    with_source(source, || {
+        run_panel_request_inner(source, base_url, action, payload)
+    })
 }
 
 fn run_panel_request_inner(
-    source: &BookSource, base_url: &str, action: &str, payload: &JsonValue,
+    source: &BookSource,
+    base_url: &str,
+    action: &str,
+    payload: &JsonValue,
 ) -> anyhow::Result<JsonValue> {
     let headers = crate::crawler::url_analyzer::source_header_spec(source)?.headers;
     let text_of = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("");
@@ -5626,7 +5983,7 @@ fn run_panel_request_inner(
             if !extra.trim().is_empty() {
                 merged.extend(parse_source_headers(&extra));
             }
-            js_http(&method, &url, &body, "{}", &merged)
+            js_http(&method, &url, body, "{}", &merged)
         }
         // 只有浏览器 `fetch` 形态豁免书源并发限速。手机端面板里 window.fetch 是
         // WebView 自己发的请求(不经过书源限速器), 而 java.ajax/get/post 走
@@ -5641,7 +5998,7 @@ fn run_panel_request_inner(
             if !extra.trim().is_empty() {
                 merged.extend(parse_source_headers(&extra));
             }
-            js_panel_fetch(&method, &url, &body, &merged)
+            js_panel_fetch(&method, &url, body, &merged)
         }
         other => anyhow::bail!("未知的请求类型 {other}"),
     };
@@ -5670,7 +6027,7 @@ pub fn panel_digest(payload: &JsonValue) -> anyhow::Result<String> {
     let text_of = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let input = text_of("input");
     match text_of("kind") {
-        "md5" => Ok(md5_hex(&input)),
+        "md5" => Ok(md5_hex(input)),
         "base64" => Ok(base64::engine::general_purpose::STANDARD.encode(input.as_bytes())),
         "unbase64" => {
             let bytes = decode_base64_lenient(input.trim())
@@ -5821,7 +6178,10 @@ mod tests {
 
     #[test]
     fn java_date_format_to_chrono_converts_common_patterns() {
-        assert_eq!(java_date_format_to_chrono("yyyy-MM-dd HH:mm:ss"), "%Y-%m-%d %H:%M:%S");
+        assert_eq!(
+            java_date_format_to_chrono("yyyy-MM-dd HH:mm:ss"),
+            "%Y-%m-%d %H:%M:%S"
+        );
         assert_eq!(java_date_format_to_chrono("yyyy/MM/dd"), "%Y/%m/%d");
         assert_eq!(java_date_format_to_chrono("HH:mm"), "%H:%M");
     }
@@ -5887,8 +6247,15 @@ mod tests {
         .unwrap();
         assert_eq!(encrypted, "tJzEHmM1hTDNyM9hQ+3rdQ==");
 
-        let decrypted =
-            symmetric_codec("dec", "DESede/CBC/PKCS5Padding", key, "", &encrypted, "auto").unwrap();
+        let decrypted = symmetric_codec(
+            "dec",
+            "DESede/CBC/PKCS5Padding",
+            key,
+            "",
+            &encrypted,
+            "auto",
+        )
+        .unwrap();
         assert_eq!(decrypted, "测试文本");
     }
 
@@ -6058,7 +6425,9 @@ mod tests {
             js_lib: Some("function reuseLib(){ return 'a'; }".to_string()),
             ..Default::default()
         };
-        with_source(&other_source, || eval_js("typeof reuseLib", "", "").unwrap());
+        with_source(&other_source, || {
+            eval_js("typeof reuseLib", "", "").unwrap()
+        });
         assert_ne!(
             cached_js_lib_key().as_deref(),
             Some(first.as_str()),
@@ -6102,7 +6471,9 @@ mod tests {
         });
 
         // 书源 B 不应看到它
-        let seen = with_source(&source_b, || eval_js("typeof __isolate_probe", "", "").unwrap());
+        let seen = with_source(&source_b, || {
+            eval_js("typeof __isolate_probe", "", "").unwrap()
+        });
         assert_eq!(seen, "undefined", "不同书源不应共享规则脚本的全局变量");
     }
 
@@ -6126,7 +6497,10 @@ mod tests {
     #[test]
     fn java_get_string_parses_current_page() {
         let html = r#"<html><body><div class="title">标题</div><span class="tag">A</span><span class="tag">B</span></body></html>"#;
-        assert_eq!(eval_js("java.getString('.title')", html, "").unwrap(), "标题");
+        assert_eq!(
+            eval_js("java.getString('.title')", html, "").unwrap(),
+            "标题"
+        );
         assert_eq!(
             eval_js("java.getStringList('.tag').join(',')", html, "").unwrap(),
             "A,B"
@@ -6225,7 +6599,8 @@ mod tests {
 
     /// 元素 `select()` 在元素内部继续查询。
     #[test]
-    fn java_element_select_queries_within_element() {        let html = r#"<html><body><div class="box"><span class="inner">内</span></div><div class="box"><span class="inner">外</span></div></body></html>"#;
+    fn java_element_select_queries_within_element() {
+        let html = r#"<html><body><div class="box"><span class="inner">内</span></div><div class="box"><span class="inner">外</span></div></body></html>"#;
         let out = eval_js(
             "var els = java.getElements('.box'); \
              els[0].select('.inner').length + '|' + els[0].select('.inner')[0].text()",
@@ -6236,7 +6611,12 @@ mod tests {
         assert_eq!(out, "1|内");
         // JSoup 语义: select() 只查后代, 不含元素自身
         assert_eq!(
-            eval_js("java.getElements('.box')[0].select('.box').length", html, "").unwrap(),
+            eval_js(
+                "java.getElements('.box')[0].select('.box').length",
+                html,
+                ""
+            )
+            .unwrap(),
             "0"
         );
     }
@@ -6312,8 +6692,12 @@ mod tests {
 
     /// JSONPath 规则。
     #[test]
-    fn java_get_string_supports_jsonpath() {        let json_text = r#"{"name":"书","tags":["a","b"]}"#;
-        assert_eq!(eval_js("java.getString('$.name')", json_text, "").unwrap(), "书");
+    fn java_get_string_supports_jsonpath() {
+        let json_text = r#"{"name":"书","tags":["a","b"]}"#;
+        assert_eq!(
+            eval_js("java.getString('$.name')", json_text, "").unwrap(),
+            "书"
+        );
         assert_eq!(
             eval_js("java.getStringList('$.tags').join(',')", json_text, "").unwrap(),
             "a,b"
@@ -6322,7 +6706,8 @@ mod tests {
 
     /// Rhino 的 `new java.util.HashMap()` / `new java.lang.String()` 互操作 shim。
     #[test]
-    fn prelude_shims_java_hashmap_and_string() {        let map = eval_js(
+    fn prelude_shims_java_hashmap_and_string() {
+        let map = eval_js(
             "var m = new java.util.HashMap(); m.put('a', 1); m.put('b', 2); \
              m.get('a') + '-' + m.size() + '-' + m.containsKey('b') + '-' + m.getOrDefault('z', 9)",
             "",
@@ -6379,14 +6764,10 @@ mod tests {
             ..Default::default()
         };
         let payload = json!({ "script": "panelHelper('ok')" });
-        let out = with_source(&source, || {
-            run_panel_request(&source, "", "run", &payload)
-        });
+        let out = with_source(&source, || run_panel_request(&source, "", "run", &payload));
         // `run` 不由 run_panel_request 处理(它只负责网络), 这里验证 jsLib 已生效
         assert!(out.is_err());
-        let direct = with_source(&source, || {
-            eval_js("panelHelper('ok')", "", "").unwrap()
-        });
+        let direct = with_source(&source, || eval_js("panelHelper('ok')", "", "").unwrap());
         assert_eq!(direct, "lib:ok");
     }
 
@@ -6467,7 +6848,8 @@ mod tests {
     /// 面板脚本形如 `writeConfig(chapter, 'k', v, java)`, 依赖 book/chapter/java 绑定。
     /// 缺少绑定时插件保存配置会静默失败(写到空对象上)。
     #[test]
-    fn panel_run_script_sees_book_chapter_and_java() {        let source = BookSource {
+    fn panel_run_script_sees_book_chapter_and_java() {
+        let source = BookSource {
             book_source_name: "面板绑定".to_string(),
             book_source_url: "https://panel-bind.example".to_string(),
             ..Default::default()
@@ -6490,9 +6872,13 @@ mod tests {
 
     /// 面板缓存与书源变量共用存储(`sp:` 前缀), 面板里改的配置正文规则能读到。
     #[test]
-    fn panel_cache_round_trips_with_source_scope() {        let url = "https://panel-cache.example";
+    fn panel_cache_round_trips_with_source_scope() {
+        let url = "https://panel-cache.example";
         put_panel_cache(url, "paraOffsets", "[1,2]");
-        assert_eq!(get_panel_cache(url, "paraOffsets").as_deref(), Some("[1,2]"));
+        assert_eq!(
+            get_panel_cache(url, "paraOffsets").as_deref(),
+            Some("[1,2]")
+        );
 
         // 与 `source.get` 读的是同一份存储
         let source = BookSource {
@@ -6570,8 +6956,14 @@ mod tests {
         assert_eq!(out, "第一章");
 
         // 缺 1 个 '=' 的常见形态也要能解
-        assert_eq!(eval_js("java.base64Decode('5Lit5paH')", "", "").unwrap(), "中文");
-        assert_eq!(eval_js("java.base64Decode('5Lit5paH').length", "", "").unwrap(), "2");
+        assert_eq!(
+            eval_js("java.base64Decode('5Lit5paH')", "", "").unwrap(),
+            "中文"
+        );
+        assert_eq!(
+            eval_js("java.base64Decode('5Lit5paH').length", "", "").unwrap(),
+            "2"
+        );
     }
 
     /// issue #13: `source.getKey()` 必须返回 bookSourceUrl（legado 语义）。
@@ -6603,7 +6995,12 @@ mod tests {
     fn java_string_is_not_treated_as_byte_sequence() {
         // 两者必须一致：显式 new java.lang.String 与 java.* 返回值的语义相同
         assert_eq!(
-            eval_js("String(java.__isByteSequence(java.md5Encode('abc')))", "", "").unwrap(),
+            eval_js(
+                "String(java.__isByteSequence(java.md5Encode('abc')))",
+                "",
+                ""
+            )
+            .unwrap(),
             "false"
         );
         let from_helper = eval_js(
@@ -6622,7 +7019,12 @@ mod tests {
 
         // 旧书源把 java.* 返回值当原生字符串用: slice/match/indexOf 仍要可用
         assert_eq!(
-            eval_js("java.md5Encode('abc').slice(0,8) + '|' + /9001/.test(java.md5Encode('abc'))", "", "").unwrap(),
+            eval_js(
+                "java.md5Encode('abc').slice(0,8) + '|' + /9001/.test(java.md5Encode('abc'))",
+                "",
+                ""
+            )
+            .unwrap(),
             "90015098|true"
         );
     }
@@ -6676,7 +7078,12 @@ mod tests {
             "9001"
         );
         assert_eq!(
-            eval_js("var n=0; for (var ch of java.md5Encode('abc')) n++; String(n)", "", "").unwrap(),
+            eval_js(
+                "var n=0; for (var ch of java.md5Encode('abc')) n++; String(n)",
+                "",
+                ""
+            )
+            .unwrap(),
             "32"
         );
     }
@@ -6793,7 +7200,12 @@ mod tests {
     /// 补括号的改写本身要幂等: 已经带括号的脚本不该再被包一层。
     #[test]
     fn bare_destructuring_patch_is_idempotent() {
-        let out = eval_js("var rows = [[1,2]]; var sum = 0; rows.map(([a, b]) => { sum += a + b; }); String(sum)", "", "").unwrap();
+        let out = eval_js(
+            "var rows = [[1,2]]; var sum = 0; rows.map(([a, b]) => { sum += a + b; }); String(sum)",
+            "",
+            "",
+        )
+        .unwrap();
         assert_eq!(out, "3");
     }
 
@@ -6809,7 +7221,10 @@ mod tests {
         )
         .expect_err("运行期抛错必须失败");
         let message = err.to_string();
-        assert!(message.contains("BOOM-runtime"), "真实原因被吞掉了: {message}");
+        assert!(
+            message.contains("BOOM-runtime"),
+            "真实原因被吞掉了: {message}"
+        );
     }
 
     /// `Packages.java.net.URL(...).openConnection()` 走字节路径。真实 Java 的
@@ -6819,8 +7234,16 @@ mod tests {
     #[test]
     fn byte_path_requests_do_not_inherit_host_retries() {
         let no_options = serde_json::json!({});
-        assert_eq!(js_request_retry(&no_options, true), 0, "字节路径默认单次尝试");
-        assert_eq!(js_request_retry(&no_options, false), 2, "文本路径保持宽松重试");
+        assert_eq!(
+            js_request_retry(&no_options, true),
+            0,
+            "字节路径默认单次尝试"
+        );
+        assert_eq!(
+            js_request_retry(&no_options, false),
+            2,
+            "文本路径保持宽松重试"
+        );
 
         // 脚本显式指定的 retry 仍然生效, 上限 5。
         let explicit = serde_json::json!({ "retry": 3 });
@@ -6835,8 +7258,16 @@ mod tests {
     #[test]
     fn panel_requests_skip_source_rate_limit() {
         let rate = Some("1/1000".to_string());
-        assert_eq!(js_concurrent_rate(true, rate.clone()), None, "面板请求不排队");
-        assert_eq!(js_concurrent_rate(false, rate.clone()), rate, "书籍请求照旧排队");
+        assert_eq!(
+            js_concurrent_rate(true, rate.clone()),
+            None,
+            "面板请求不排队"
+        );
+        assert_eq!(
+            js_concurrent_rate(false, rate.clone()),
+            rate,
+            "书籍请求照旧排队"
+        );
         assert_eq!(js_concurrent_rate(false, None), None);
     }
 
@@ -6976,7 +7407,10 @@ mod tests {
 
             // 第二次：复用同一上下文，prelude 走 __runPrelude() 快速路径
             let second = eval_js(script, "", "").unwrap();
-            assert_eq!(second, first, "复用上下文后 java 接口必须仍然可用且结果一致");
+            assert_eq!(
+                second, first,
+                "复用上下文后 java 接口必须仍然可用且结果一致"
+            );
 
             // 每次的 result 绑定必须是最新一次传入的值
             assert_eq!(eval_js("String(result)", "第一次", "").unwrap(), "第一次");
@@ -7022,7 +7456,8 @@ mod tests {
 
     /// 字节输入不能被当成文本：`result` 必须是数组，`src` 仍是图片地址。
     #[test]
-    fn cover_decode_js_injects_bytes_and_src() {        let source = BookSource {
+    fn cover_decode_js_injects_bytes_and_src() {
+        let source = BookSource {
             book_source_name: "字节注入".to_string(),
             book_source_url: "https://img.example".to_string(),
             ..Default::default()
@@ -7042,7 +7477,8 @@ mod tests {
 
     /// 没有封面解密上下文时，`decrypt` 仍按文本输出（不能影响正文/目录规则）。
     #[test]
-    fn decrypt_stays_text_outside_cover_context() {        let source = BookSource {
+    fn decrypt_stays_text_outside_cover_context() {
+        let source = BookSource {
             book_source_name: "文本解密".to_string(),
             book_source_url: "https://text.example".to_string(),
             ..Default::default()
@@ -7098,9 +7534,18 @@ mod tests {
             decodeImage(result, 0xFF)
         "#;
         let out = with_source(&source, || {
-            eval_js_cover_decode(script, "https://img.example/x.jpg", &[0x00, 0x01, 0xFE, 0xFF]).unwrap()
+            eval_js_cover_decode(
+                script,
+                "https://img.example/x.jpg",
+                &[0x00, 0x01, 0xFE, 0xFF],
+            )
+            .unwrap()
         });
-        assert_eq!(out, vec![0xFF, 0xFE, 0x01, 0x00], "逐字节异或必须按原始字节算");
+        assert_eq!(
+            out,
+            vec![0xFF, 0xFE, 0x01, 0x00],
+            "逐字节异或必须按原始字节算"
+        );
     }
 
     /// `java.io.ByteArrayInputStream` 在封面上下文里也能用（compat 层提供）。
@@ -7122,4 +7567,3 @@ mod tests {
         assert_eq!(out, b"65|133".to_vec());
     }
 }
-

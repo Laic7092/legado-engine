@@ -1,4 +1,4 @@
-.PHONY: build test test-c fmt clean
+.PHONY: build test test-c lint fmt clean
 
 build:
 	cargo build --release --lib
@@ -6,12 +6,16 @@ build:
 test:
 	cargo test
 
+lint:
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
+
 test-c: build
 	$(CC) -O2 -I. tests/c_abi.c target/release/liblegado_engine.a -lpthread -ldl -lm -o target/c_abi
 	./target/c_abi
 
 fmt:
-	rustfmt --edition 2021 src/abi.rs src/pipeline.rs src/service/*.rs tests/*.rs examples/*.rs
+	cargo fmt
 
 clean:
 	cargo clean

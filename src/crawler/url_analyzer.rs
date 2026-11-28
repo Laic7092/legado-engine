@@ -1,7 +1,7 @@
 use crate::crawler::fetcher::{HttpMethod, RequestSpec};
-use crate::error::error::AppError;
+use crate::error::AppError;
 use crate::model::book_source::BookSource;
-use crate::parser::js::{eval_js, eval_js_url, with_source, login_headers};
+use crate::parser::js::{eval_js, eval_js_url, login_headers, with_source};
 use crate::util::text::normalize_source_url;
 use encoding_rs::Encoding;
 use regex::Regex;
@@ -23,7 +23,7 @@ pub fn analyze_url(
     base_url: &str,
     source: &BookSource,
 ) -> Result<RequestSpec, AppError> {
-    with_source(source,|| {
+    with_source(source, || {
         let base_url = strip_url_options(&normalize_source_url(base_url)).to_string();
         let mut rule_url = m_url.to_string();
         let mut header_spec = source_header_spec(source)?;
@@ -49,9 +49,12 @@ pub fn analyze_url(
             let options = parse_url_options(options)?;
             if let Some(raw_method) = options.get("method").and_then(Value::as_str) {
                 method = match raw_method.to_ascii_uppercase().as_str() {
-                    "POST" => HttpMethod::POST, "HEAD" => HttpMethod::HEAD,
-                    "PUT" => HttpMethod::PUT, "PATCH" => HttpMethod::PATCH,
-                    "DELETE" => HttpMethod::DELETE, _ => HttpMethod::GET,
+                    "POST" => HttpMethod::POST,
+                    "HEAD" => HttpMethod::HEAD,
+                    "PUT" => HttpMethod::PUT,
+                    "PATCH" => HttpMethod::PATCH,
+                    "DELETE" => HttpMethod::DELETE,
+                    _ => HttpMethod::GET,
                 };
             }
             if let Some(value) = options.get("charset").and_then(Value::as_str) {
@@ -106,7 +109,9 @@ pub fn analyze_url(
                     // 所以只接受「看起来确实是地址」的返回值（带 scheme 或站内绝对
                     // 路径），其余一律保留原 url —— 这个源的脚本末尾就是
                     // `try{cookie.removeCookie(u)}catch(e){}`，完成值为 `true`。
-                    if let Ok(value) = eval_js_url(script, &url, key, page, &source.book_source_url, &base_url) {
+                    if let Ok(value) =
+                        eval_js_url(script, &url, key, page, &source.book_source_url, &base_url)
+                    {
                         let value = value.trim();
                         if looks_like_url(value) {
                             url = value.to_string();
@@ -289,7 +294,12 @@ fn looks_like_url(value: &str) -> bool {
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         return false;
     }
-    if value.starts_with("//") || value.starts_with('/') || value.starts_with("./") || value.starts_with("../") || value.starts_with('?') {
+    if value.starts_with("//")
+        || value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('?')
+    {
         return true;
     }
     // `scheme:` —— scheme 必须是「字母开头 + 字母/数字/+/-/.」，避免把
@@ -547,10 +557,15 @@ pub(crate) fn split_url_options(spec: &str) -> (&str, Option<&str>) {
             '{' | '[' if !in_string => depth += 1,
             '}' | ']' if !in_string => depth -= 1,
             ',' if !in_string && depth == 0 => {
-                if data_separator { data_separator = false; continue; }
+                if data_separator {
+                    data_separator = false;
+                    continue;
+                }
                 let left = &spec[..idx];
                 let right = &spec[idx + ch.len_utf8()..];
-                if right.trim_start().starts_with('{') { return (left, Some(right.trim())); }
+                if right.trim_start().starts_with('{') {
+                    return (left, Some(right.trim()));
+                }
             }
             _ => {}
         }
@@ -886,13 +901,15 @@ mod tests {
     fn java_url_encoder_honours_charset() {
         // 「剑来」GBK = BD A3 C0 B4；UTF-8 = E5 89 91 E6 9D A5
         assert_eq!(java_url_encoder("剑来", Some("gbk")), "%BD%A3%C0%B4");
-        assert_eq!(java_url_encoder("剑来", Some("UTF-8")), "%E5%89%91%E6%9D%A5");
+        assert_eq!(
+            java_url_encoder("剑来", Some("UTF-8")),
+            "%E5%89%91%E6%9D%A5"
+        );
         assert_eq!(java_url_encoder("剑来", None), "%E5%89%91%E6%9D%A5");
         // Java URLEncoder 的 form 语义
         assert_eq!(java_url_encoder("a b", None), "a+b");
         assert_eq!(java_url_encoder("100%", None), "100%25");
     }
-
 
     /// 规范 JSON 选项走严格解析（最常走的路径）。
     #[test]
@@ -900,7 +917,10 @@ mod tests {
         let options = parse_url_options(r#"{"method":"POST","headers":{"A":"B"}}"#).unwrap();
         assert_eq!(options.get("method").and_then(Value::as_str), Some("POST"));
         assert_eq!(
-            options.get("headers").and_then(|h| h.get("A")).and_then(Value::as_str),
+            options
+                .get("headers")
+                .and_then(|h| h.get("A"))
+                .and_then(Value::as_str),
             Some("B")
         );
     }
@@ -912,16 +932,20 @@ mod tests {
     /// legado 用 GSON 宽松模式能读，所以手机端正常。
     #[test]
     fn parses_single_quoted_js_object_options() {
-        let options = parse_url_options(
-            r#"{'headers':'{"User-Agent": "Mozilla/5.0"}'}"#,
-        )
-        .expect("单引号 JS 字面量应当可解析");
+        let options = parse_url_options(r#"{'headers':'{"User-Agent": "Mozilla/5.0"}'}"#)
+            .expect("单引号 JS 字面量应当可解析");
 
         // 内层 headers 是「JSON 文本」而非对象 —— 与 legado 行为一致，
         // 由 headers_from_value 再做一次解析。
-        let raw = options.get("headers").and_then(Value::as_str).unwrap_or_default();
+        let raw = options
+            .get("headers")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let inner: Value = serde_json::from_str(raw).expect("内层应为 JSON 文本");
-        assert_eq!(inner.get("User-Agent").and_then(Value::as_str), Some("Mozilla/5.0"));
+        assert_eq!(
+            inner.get("User-Agent").and_then(Value::as_str),
+            Some("Mozilla/5.0")
+        );
     }
 
     /// 无引号键名（JS 对象字面量的另一种常见写法）。
@@ -958,9 +982,8 @@ mod tests {
 
     /// POST 表单正文必须按书源声明的 `charset` 编码。
     ///
-    /// 书源把 `"charset": "GBK"` 写在搜索 URL 的选项里，站点按 GBK 解码关键词。
-    /// 早先正文一律按 UTF-8 编码，站点拿到的是一串乱码，于是「搜索永远无结果，
-    /// 但发现页正常」（发现页走 GET，编码路径是另一条）。
+    /// 书源把 `"charset": "GBK"` 写在搜索 URL 的选项里，站点按 GBK 解码关键词；
+    /// 一律按 UTF-8 编码会让站点收到乱码，搜索恒无结果（发现页走 GET，不受影响）。
     #[test]
     fn post_body_uses_declared_charset() {
         let body = encode_post_body("submit=&type=articlename&s=我的", Some("GBK"), false);

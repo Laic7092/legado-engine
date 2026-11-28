@@ -103,7 +103,10 @@ fn a_declared_utf8_file_keeps_its_bytes() {
 
     let done = engine.download(&source(&base), "/utf8.txt", &dest).unwrap();
     assert_eq!(done.charset, "utf-8");
-    assert_eq!(done.content_type.as_deref(), Some("text/plain; charset=utf-8"));
+    assert_eq!(
+        done.content_type.as_deref(),
+        Some("text/plain; charset=utf-8")
+    );
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "第一行\n第二行\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -120,7 +123,9 @@ fn a_failed_download_writes_nothing() {
     let dir = temp_dir("missing");
     let dest = dir.join("book.txt");
 
-    let error = engine.download(&source(&base), "/missing.txt", &dest).unwrap_err();
+    let error = engine
+        .download(&source(&base), "/missing.txt", &dest)
+        .unwrap_err();
     assert!(error.to_string().contains("404"), "{error:#}");
     assert!(!dest.exists());
     assert!(!dir.join("book.txt.part").exists());

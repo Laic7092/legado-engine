@@ -1,0 +1,58 @@
+[
+  {
+    "bookSourceName": "旧版在线源",
+    "bookSourceUrl": "https://old.test",
+    "enable": false,
+    "serialNumber": 7,
+    "httpUserAgent": "Mozilla/5.0 (old)",
+    "ruleSearchUrl": "/search?q={{key}}&page={{page}}",
+    "ruleFindUrl": "/find",
+    "ruleSearch": {
+      "ruleSearchList": "div.book",
+      "ruleSearchName": "a.name@text",
+      "ruleSearchAuthor": "span.au@text",
+      "ruleSearchBookUrl": "a@href"
+    },
+    "ruleBookInfo": {
+      "ruleBookName": "h1@text",
+      "ruleBookIntro": "#intro@text",
+      "ruleBookTocUrl": "#toc@href"
+    },
+    "ruleChapterList": "#list a",
+    "ruleChapterName": "text",
+    "ruleContentUrl": "href",
+    "ruleBookContent": "#content@html",
+    "ruleBookContentReplace": "（本章完）",
+    "ruleContentUrlNext": "a.next@href"
+  },
+  {
+    "bookSourceName": "旧版 JS 源",
+    "bookSourceUrl": "https://js.test",
+    "ruleSearch": {
+      "ruleSearchList": "@js:JSON.parse(result).data",
+      "ruleSearchName": "name",
+      "ruleSearchBookUrl": "url"
+    }
+  },
+  {
+    "sourceName": "旧版订阅",
+    "sourceUrl": "https://rss.test/feed",
+    "enable": true,
+    "ruleArticleList": "div.item",
+    "ruleArticleTitle": "a@text",
+    "ruleArticleLink": "a@href",
+    "ruleArticleDate": "time@text",
+    "ruleArticleContent": "#content@html"
+  },
+  {
+    "name": "旧版净化",
+    "id": 3,
+    "pattern": "（本章完）",
+    "replacement": "",
+    "isEnabled": true,
+    "isRegex": false,
+    "scopeTitle": false,
+    "scopeContent": true,
+    "order": 1
+  }
+]

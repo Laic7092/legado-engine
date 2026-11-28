@@ -161,9 +161,7 @@ fn protect_tag_blocks(
         // 必须落在标签边界上：`<images>` 不算 `<img>`。
         let after = lowercase.as_bytes().get(start + open.len()).copied();
         let boundary_ok = match after {
-            Some(byte) => {
-                !byte.is_ascii_alphanumeric() && byte != b'-' && byte != b'_'
-            }
+            Some(byte) => !byte.is_ascii_alphanumeric() && byte != b'-' && byte != b'_',
             None => false,
         };
         if !boundary_ok {

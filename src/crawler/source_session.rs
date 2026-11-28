@@ -1,6 +1,11 @@
 use cookie_store::CookieStore;
 use reqwest::{cookie::CookieStore as ReqwestCookieStore, header::HeaderValue};
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use url::Url;
 
 /// One source owns one cookie store, including requests made by its scripts.
@@ -12,10 +17,15 @@ pub struct SourceCookieJar {
 
 impl SourceCookieJar {
     pub fn new(path: Option<PathBuf>) -> Self {
-        let store = path.as_ref().and_then(|path| fs::read(path).ok())
+        let store = path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| cookie_store::serde::json::load(bytes.as_slice()).ok())
             .unwrap_or_default();
-        Self { store: Mutex::new(store), path }
+        Self {
+            store: Mutex::new(store),
+            path,
+        }
     }
 
     fn persist(&self, store: &CookieStore) -> anyhow::Result<()> {
@@ -29,8 +39,13 @@ impl SourceCookieJar {
     }
 
     pub fn get(&self, url: &Url) -> String {
-        self.store.lock().unwrap_or_else(|e| e.into_inner()).get_request_values(url)
-            .map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join("; ")
+        self.store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// 当前 jar 里的全部 Cookie（供注入验证窗口，见
@@ -87,6 +102,9 @@ impl SourceCookieJar {
     ///
     /// 这里自己构造 `cookie::Cookie` 并调用 `insert_raw`，`Domain` 因此被当作
     /// 真实作用域处理，与浏览器行为一致。
+    // 8 个参数对应接口本身要表达的语义（名字、值、域、路径、secure、
+    // httpOnly 以及用来算默认域的请求地址），打包成结构体只是把参数换个地方写。
+    #[allow(clippy::too_many_arguments)]
     pub fn set_detailed(
         &self,
         name: &str,
@@ -97,8 +115,8 @@ impl SourceCookieJar {
         http_only: bool,
         request_url: &Url,
     ) -> anyhow::Result<()> {
-        let mut builder = cookie::Cookie::build((name.to_string(), value.to_string()))
-            .path(path.to_string());
+        let mut builder =
+            cookie::Cookie::build((name.to_string(), value.to_string())).path(path.to_string());
         // **只有带前导点才算域级 cookie**（RFC 6265：`Domain=.example.com` 表示
         // 整域，不带点表示 host-only）。
         //
@@ -142,15 +160,20 @@ impl SourceCookieJar {
     pub fn remove(&self, url: &Url, name: &str) -> anyhow::Result<()> {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = store.clone();
-        let keys = next.iter_any()
+        let keys = next
+            .iter_any()
             .filter(|cookie| cookie.domain.matches(url) && cookie.name() == name)
-            .filter_map(|cookie| Some((
-                cookie.domain.as_cow()?.into_owned(),
-                cookie.path.as_ref().to_string(),
-                cookie.name().to_string(),
-            )))
+            .filter_map(|cookie| {
+                Some((
+                    cookie.domain.as_cow()?.into_owned(),
+                    cookie.path.as_ref().to_string(),
+                    cookie.name().to_string(),
+                ))
+            })
             .collect::<Vec<_>>();
-        for (domain, path, name) in keys { next.remove(&domain, &path, &name); }
+        for (domain, path, name) in keys {
+            next.remove(&domain, &path, &name);
+        }
         self.persist(&next)?;
         *store = next;
         Ok(())
@@ -160,9 +183,19 @@ impl SourceCookieJar {
         HeaderValue::from_str(header).map_err(|_| anyhow::anyhow!("Cookie 格式无效"))?;
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = store.clone();
-        if replace { remove_url_cookies(&mut next, url); }
-        for pair in header.split(';').map(str::trim).filter(|pair| !pair.is_empty()) {
-            anyhow::ensure!(pair.split_once('=').is_some_and(|(name, _)| !name.trim().is_empty()), "Cookie 格式无效");
+        if replace {
+            remove_url_cookies(&mut next, url);
+        }
+        for pair in header
+            .split(';')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+        {
+            anyhow::ensure!(
+                pair.split_once('=')
+                    .is_some_and(|(name, _)| !name.trim().is_empty()),
+                "Cookie 格式无效"
+            );
             next.parse(&format!("{pair}; Path=/"), url)
                 .map_err(|_| anyhow::anyhow!("Cookie 格式无效"))?;
         }
@@ -185,24 +218,42 @@ impl SourceCookieJar {
 }
 
 fn remove_url_cookies(store: &mut CookieStore, url: &Url) {
-    let keys = store.iter_any().filter(|cookie| cookie.domain.matches(url))
-        .filter_map(|cookie| Some((cookie.domain.as_cow()?.into_owned(), cookie.path.as_ref().to_string(), cookie.name().to_string())))
+    let keys = store
+        .iter_any()
+        .filter(|cookie| cookie.domain.matches(url))
+        .filter_map(|cookie| {
+            Some((
+                cookie.domain.as_cow()?.into_owned(),
+                cookie.path.as_ref().to_string(),
+                cookie.name().to_string(),
+            ))
+        })
         .collect::<Vec<_>>();
-    for (domain, path, name) in keys { store.remove(&domain, &path, &name); }
+    for (domain, path, name) in keys {
+        store.remove(&domain, &path, &name);
+    }
 }
 
 impl ReqwestCookieStore for SourceCookieJar {
     fn set_cookies(&self, headers: &mut dyn Iterator<Item = &HeaderValue>, url: &Url) {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         for header in headers {
-            if let Ok(value) = header.to_str() { let _ = store.parse(value, url); }
+            if let Ok(value) = header.to_str() {
+                let _ = store.parse(value, url);
+            }
         }
-        if let Err(err) = self.persist(&store) { tracing::warn!("保存书源会话失败: {err}"); }
+        if let Err(err) = self.persist(&store) {
+            tracing::warn!("保存书源会话失败: {err}");
+        }
     }
 
     fn cookies(&self, url: &Url) -> Option<HeaderValue> {
         let value = self.get(url);
-        if value.is_empty() { None } else { HeaderValue::from_str(&value).ok() }
+        if value.is_empty() {
+            None
+        } else {
+            HeaderValue::from_str(&value).ok()
+        }
     }
 }
 
@@ -220,44 +271,80 @@ impl SourceSession {
         let key = format!("{user_ns}::{source_url}");
         let dir = root.map(|root| root.join(crate::util::hash::md5_hex(&key)));
         let state_path = dir.as_ref().map(|dir| dir.join("state.json"));
-        let state = state_path.as_ref().and_then(|path| fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        let state = state_path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         Self {
-            identity: format!("{}::{key}", root.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+            identity: format!(
+                "{}::{key}",
+                root.map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
             source_url: source_url.to_string(),
-            cookies: Arc::new(SourceCookieJar::new(dir.map(|dir| dir.join("cookies.json")))),
-            state: Mutex::new(state), state_path,
+            cookies: Arc::new(SourceCookieJar::new(
+                dir.map(|dir| dir.join("cookies.json")),
+            )),
+            state: Mutex::new(state),
+            state_path,
             request_times: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
     }
 
     pub fn put(&self, key: &str, value: Option<&str>) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = state.clone();
         match value {
-            Some(value) => { next.insert(key.to_string(), value.to_string()); }
-            None => { next.remove(key); }
+            Some(value) => {
+                next.insert(key.to_string(), value.to_string());
+            }
+            None => {
+                next.remove(key);
+            }
         }
-        if let Some(path) = &self.state_path { write_private_state(path, &serde_json::to_vec(&next)?)?; }
+        if let Some(path) = &self.state_path {
+            write_private_state(path, &serde_json::to_vec(&next)?)?;
+        }
         *state = next;
         Ok(())
     }
 
-    pub async fn request(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>) -> anyhow::Result<super::fetcher::FetchResponse> {
+    pub async fn request(
+        &self,
+        client: &reqwest::Client,
+        req: super::fetcher::RequestSpec,
+        rate: Option<&str>,
+    ) -> anyhow::Result<super::fetcher::FetchResponse> {
         self.request_with(client, req, rate, false).await
     }
 
     /// 字节级请求: 与 [`Self::request`] 相同的限速/串行语义, 但请求体按原始字节
     /// 发送, 响应体不自动解压。
-    pub async fn request_raw(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>) -> anyhow::Result<super::fetcher::FetchResponse> {
+    pub async fn request_raw(
+        &self,
+        client: &reqwest::Client,
+        req: super::fetcher::RequestSpec,
+        rate: Option<&str>,
+    ) -> anyhow::Result<super::fetcher::FetchResponse> {
         self.request_with(client, req, rate, true).await
     }
 
-    async fn request_with(&self, client: &reqwest::Client, req: super::fetcher::RequestSpec, rate: Option<&str>, raw: bool) -> anyhow::Result<super::fetcher::FetchResponse> {
+    async fn request_with(
+        &self,
+        client: &reqwest::Client,
+        req: super::fetcher::RequestSpec,
+        rate: Option<&str>,
+        raw: bool,
+    ) -> anyhow::Result<super::fetcher::FetchResponse> {
         // 只有最后一步的发送方式随 `raw` 变化, 限速/串行逻辑完全一致:
         // 用 `send` 收口, 避免在每条提前返回的分支里重复同一个 if/else。
         macro_rules! send {
@@ -287,10 +374,28 @@ impl SourceSession {
         let mut starts = self.request_times.lock().await;
         let window = std::time::Duration::from_millis(duration);
         loop {
+            crate::cancel::check()?;
             let now = tokio::time::Instant::now();
-            while starts.front().is_some_and(|start| now.duration_since(*start) >= window) { starts.pop_front(); }
-            if starts.len() < limit { break; }
-            tokio::time::sleep_until(*starts.front().unwrap() + window).await;
+            while starts
+                .front()
+                .is_some_and(|start| now.duration_since(*start) >= window)
+            {
+                starts.pop_front();
+            }
+            if starts.len() < limit {
+                break;
+            }
+            // 排队期间可以取消：限速窗口可能长达几十秒。
+            match crate::cancel::guard(tokio::time::sleep_until(*starts.front().unwrap() + window))
+                .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    // 没发出去的请求不占窗口，别把后来者顶到窗口外。
+                    drop(starts);
+                    return Err(error);
+                }
+            }
         }
         starts.push_back(tokio::time::Instant::now());
         if !serial {
@@ -317,11 +422,14 @@ pub struct SourceHttpContext {
 }
 
 pub(crate) fn write_private_state(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }

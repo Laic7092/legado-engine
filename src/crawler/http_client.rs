@@ -1,9 +1,9 @@
+use super::source_session::{SourceHttpContext, SourceSession};
 use reqwest::{Client, NoProxy, Proxy};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use url::Url;
 use std::{collections::HashMap, path::PathBuf};
-use super::source_session::{SourceHttpContext, SourceSession};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyMode {
@@ -73,10 +73,18 @@ impl HttpClient {
     }
 
     pub fn set_source_storage_dir(&self, path: PathBuf) {
-        *self.source_storage_dir.write().unwrap_or_else(|e| e.into_inner()) = Some(path);
+        *self
+            .source_storage_dir
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(path);
     }
 
-    pub fn source_context(&self, user_ns: &str, source_url: &str, proxy: Option<&str>) -> anyhow::Result<SourceHttpContext> {
+    pub fn source_context(
+        &self,
+        user_ns: &str,
+        source_url: &str,
+        proxy: Option<&str>,
+    ) -> anyhow::Result<SourceHttpContext> {
         let proxy = match proxy.map(str::trim).filter(|v| !v.is_empty()) {
             Some(value) => resolve_manual_proxy(value)?,
             None => self.active_proxy(),
@@ -106,18 +114,34 @@ impl HttpClient {
         let source_url = crate::util::text::normalize_source_url(source_url);
         let key = format!("{user_ns}::{source_url}");
         let session = {
-            let mut sessions = self.source_sessions.write().unwrap_or_else(|e| e.into_inner());
-            sessions.entry(key.clone()).or_insert_with(|| {
-                let root = self.source_storage_dir.read().unwrap_or_else(|e| e.into_inner());
-                Arc::new(SourceSession::new(user_ns, &source_url, root.as_deref()))
-            }).clone()
+            let mut sessions = self
+                .source_sessions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            sessions
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let root = self
+                        .source_storage_dir
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
+                    Arc::new(SourceSession::new(user_ns, &source_url, root.as_deref()))
+                })
+                .clone()
         };
         let client_key = format!("{key}::proxy={}", proxy.as_deref().unwrap_or(""));
-        let mut clients = self.source_clients.write().unwrap_or_else(|e| e.into_inner());
+        let mut clients = self
+            .source_clients
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let client = match clients.get(&client_key) {
             Some(client) => client.clone(),
             None => {
-                let client = build_source_client(self.timeout_secs, proxy.as_deref(), session.cookies.clone())?;
+                let client = build_source_client(
+                    self.timeout_secs,
+                    proxy.as_deref(),
+                    session.cookies.clone(),
+                )?;
                 clients.insert(client_key.clone(), client.clone());
                 client
             }
@@ -130,7 +154,11 @@ impl HttpClient {
         let client_no_redirect = match clients.get(&no_redirect_key) {
             Some(client) => client.clone(),
             None => {
-                let client = build_source_client_no_redirect(self.timeout_secs, proxy.as_deref(), session.cookies.clone())?;
+                let client = build_source_client_no_redirect(
+                    self.timeout_secs,
+                    proxy.as_deref(),
+                    session.cookies.clone(),
+                )?;
                 clients.insert(no_redirect_key, client.clone());
                 client
             }
@@ -213,7 +241,10 @@ impl HttpClient {
                 .active_proxy
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = configured_proxy.clone();
-            self.source_clients.write().unwrap_or_else(|e| e.into_inner()).clear();
+            self.source_clients
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
 
         Ok(ProxyStatus {
@@ -242,11 +273,21 @@ impl HttpClient {
 }
 
 fn build_client(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<Client> {
-    build_client_builder(timeout_secs, proxy)?.cookie_store(true).build().map_err(Into::into)
+    build_client_builder(timeout_secs, proxy)?
+        .cookie_store(true)
+        .build()
+        .map_err(Into::into)
 }
 
-pub(crate) fn build_source_client(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
-    build_source_builder(timeout_secs, proxy)?.cookie_provider(jar).build().map_err(Into::into)
+pub(crate) fn build_source_client(
+    timeout_secs: u64,
+    proxy: Option<&str>,
+    jar: Arc<super::source_session::SourceCookieJar>,
+) -> anyhow::Result<Client> {
+    build_source_builder(timeout_secs, proxy)?
+        .cookie_provider(jar)
+        .build()
+        .map_err(Into::into)
 }
 
 /// 与 [`build_source_client`] 相同, 但不跟随 3xx。
@@ -255,7 +296,11 @@ pub(crate) fn build_source_client(timeout_secs: u64, proxy: Option<&str>, jar: A
 /// `java.post`)。书源用这种写法**读 302 响应的 `Location` 头**完成两步搜索:
 /// 先用搜索词换一个 `searchid`, 再拿它拼结果页地址。跟随后 `Location` 消失,
 /// 脚本在 `location.match(...)` 处抛空引用, 整个搜索直接失败。
-pub(crate) fn build_source_client_no_redirect(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
+pub(crate) fn build_source_client_no_redirect(
+    timeout_secs: u64,
+    proxy: Option<&str>,
+    jar: Arc<super::source_session::SourceCookieJar>,
+) -> anyhow::Result<Client> {
     build_source_builder(timeout_secs, proxy)?
         .redirect(reqwest::redirect::Policy::none())
         .cookie_provider(jar)
@@ -268,7 +313,11 @@ pub(crate) fn build_source_client_no_redirect(timeout_secs: u64, proxy: Option<&
 /// `java.net.URL(...).openConnection()` 形态的脚本按 Java 语义自行处理
 /// `Content-Encoding`(例如源脚本自己 new GZIPInputStream), 自动解压会把已解压
 /// 的正文再解一次并丢掉原始头部, 因此这条路径必须拿到未解码的字节。
-pub(crate) fn build_raw_source_client(timeout_secs: u64, proxy: Option<&str>, jar: Arc<super::source_session::SourceCookieJar>) -> anyhow::Result<Client> {
+pub(crate) fn build_raw_source_client(
+    timeout_secs: u64,
+    proxy: Option<&str>,
+    jar: Arc<super::source_session::SourceCookieJar>,
+) -> anyhow::Result<Client> {
     build_source_builder(timeout_secs, proxy)?
         .gzip(false)
         .brotli(false)
@@ -278,7 +327,10 @@ pub(crate) fn build_raw_source_client(timeout_secs: u64, proxy: Option<&str>, ja
         .map_err(Into::into)
 }
 
-fn build_client_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
+fn build_client_builder(
+    timeout_secs: u64,
+    proxy: Option<&str>,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     let builder = build_builder_base(timeout_secs, proxy)?
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     Ok(builder)
@@ -295,25 +347,42 @@ fn build_client_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Resul
 ///
 /// `http1_title_case_headers` 只影响 HTTP/1.x(h2 要求小写, hyper 会自行处理),
 /// 显式 `Host` 由 [`crate::crawler::fetcher`] 注入到请求首位。
-fn build_source_builder(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
+fn build_source_builder(
+    timeout_secs: u64,
+    proxy: Option<&str>,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     Ok(build_builder_base(timeout_secs, proxy)?
         .http1_title_case_headers()
         .http1_only())
 }
 
-/// legado 的读超时。OkHttp 里 `readTimeout = 60s`、`callTimeout = 60s`
-/// （见 legado `HttpHelper.kt`），与 15s 的连接超时是两个独立的轴。
+/// 一个请求的默认总超时。宿主可用 `config.timeoutSecs` 覆盖。
 ///
-/// 早先这里只有一个 `timeout_secs` 同时套住连接和读取：正文页/接口慢一点
-/// （尤其是带图床或反爬延迟的站）就直接超时，而手机端同样的源能读 —— 这类
-/// 「手机能看、桌面空白」有一部分就是这个原因。
+/// 15 秒：读一页正文不值得等 30 秒，更慢的站点基本已经不可用或被拦。
+pub const DEFAULT_TIMEOUT_SECS: u64 = 15;
+
+/// 建连（TCP + TLS）上限。
 ///
-/// 不把 60s 做成配置项：它是**协议层容忍度**而不是产品偏好，跟 `request_timeout_secs`
-/// （连接阶段多久算不通）语义不同，混在一起调会让用户以为调大就能救慢站，
-/// 实际先把「站点已挂」的判断拖长了。
+/// 握手失败通常是链路问题而非站点慢，因此独立于总超时：即使总超时被调到 60 秒，
+/// 10 秒握不上手就按死链报错。
+const CONNECT_TIMEOUT_CAP_SECS: u64 = 10;
+
+/// 下载文件的总超时。
+///
+/// 页面那套 15 秒不适用于大文件（7MB 的 TXT 在 3G 上要三十余秒）。只要数据仍在
+/// 到达就继续下载，连接是否已死由 [`SOURCE_READ_TIMEOUT_SECS`] 判断。
+pub const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// 单次读取的容忍度（两次收到数据之间），与 OkHttp 的 `readTimeout = 60s` 对齐。
+///
+/// 只对总超时长于它的请求（下载）生效；页面请求在 15 秒时已经结束。两个轴分工
+/// 明确："用户愿意等多久" 与 "连接是否已死"。
 const SOURCE_READ_TIMEOUT_SECS: u64 = 60;
 
-fn build_builder_base(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<reqwest::ClientBuilder> {
+fn build_builder_base(
+    timeout_secs: u64,
+    proxy: Option<&str>,
+) -> anyhow::Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder()
         // TLS：与 legado 一致，**不校验证书与主机名**。
         //
@@ -327,14 +396,17 @@ fn build_builder_base(timeout_secs: u64, proxy: Option<&str>) -> anyhow::Result<
         // Cookie，而那一层本来也是明文 HTTP 也照发。
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
-        // 连接阶段：沿用可配置的 `request_timeout_secs`。
-        .connect_timeout(Duration::from_secs(timeout_secs.max(1)))
-        // 读取阶段：按 legado 的 60s。`timeout` 是 reqwest 的**总**超时，
-        // 必须 ≥ 读超时，否则连接快的慢响应仍会被总超时砍掉。
+        // 建连：可配置的总超时之上再压一个 10 秒上限，死链路快点报错。
+        .connect_timeout(Duration::from_secs(
+            timeout_secs.clamp(1, CONNECT_TIMEOUT_CAP_SECS),
+        ))
+        // 单次读取的容忍度（只对下载这类长请求有效）。
         .read_timeout(Duration::from_secs(SOURCE_READ_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(
-            SOURCE_READ_TIMEOUT_SECS.max(timeout_secs),
-        ));
+        // 总超时：就是配置里的那个数。
+        //
+        // 这里以前写的是 `SOURCE_READ_TIMEOUT_SECS.max(timeout_secs)`，于是把
+        // `timeoutSecs` 设成 10 实际还是 60 —— 配了个寂寞。现在原样生效。
+        .timeout(Duration::from_secs(timeout_secs.max(1)));
     if let Some(proxy) = proxy {
         let bypass = NoProxy::from_string("localhost,127.0.0.1,::1");
         builder = builder.proxy(Proxy::all(proxy)?.no_proxy(bypass));
@@ -364,11 +436,18 @@ fn resolve_system_proxy() -> Option<String> {
 }
 
 fn environment_proxy() -> Option<String> {
-    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-        .into_iter()
-        .find_map(|key| std::env::var(key).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .find_map(|key| std::env::var(key).ok())
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
 }
 
 #[cfg(target_os = "windows")]
@@ -395,7 +474,12 @@ fn platform_system_proxy() -> Option<String> {
         .output()
         .ok()?;
     let services = String::from_utf8_lossy(&output.stdout);
-    for service in services.lines().skip(1).map(str::trim).filter(|line| !line.is_empty()) {
+    for service in services
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let service = service.trim_start_matches('*').trim();
         for proxy_type in ["-getsecurewebproxy", "-getwebproxy"] {
             let proxy = Command::new("networksetup")

@@ -127,7 +127,10 @@ mod tests {
     fn ignores_html_tags() {
         // 标签字符不能计入, 否则 `<p>你好</p>` 会数成 10。
         assert_eq!(visible_char_count("<p>你好</p>"), 2);
-        assert_eq!(visible_char_count("<div class=\"con\"><p>一二三</p><p>四五六</p></div>"), 6);
+        assert_eq!(
+            visible_char_count("<div class=\"con\"><p>一二三</p><p>四五六</p></div>"),
+            6
+        );
     }
 
     #[test]

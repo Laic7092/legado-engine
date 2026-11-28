@@ -2,9 +2,8 @@
 
 ## 链接
 
-`cargo build --release --lib` 产出 `liblegado_engine.a`。Linux 链接需要
-`-lpthread -ldl -lm`；其他目标需要的系统库见
-`cargo rustc --release --lib -- --print native-static-libs`。
+`cargo build --release --lib` 产出 `liblegado_engine.a`。Linux 需 `-lpthread -ldl -lm`；
+其他目标用 `cargo rustc --release --lib -- --print native-static-libs` 查。
 
 ## 生命周期
 
@@ -18,34 +17,73 @@ if (!json) { /* legado_last_error(engine) */ }
 legado_close(engine);
 ```
 
-一个进程打开一个 handle。JS 存储和 HTTP 客户端是进程级的，与 handle 无关。
+一个进程一个 handle 即可。`storageDir` 存放 cookie jar、`source.getVariable()` 的
+变量与 `java.cacheFile` 的缓存；省略则只存在内存中。
 
-## 内存
+## 内存与线程
 
-`legado_*` 返回的 `const char *` 归引擎所有，在下一次调用前有效。要跨调用保留
-就先复制。`legado_sources` 没有 handle，它的指针在下一次 `legado_sources`
-调用前有效。
+- 返回的 `const char *` 归引擎所有，在下一次同线程调用前有效；跨调用保留需复制。
+  `legado_sources` 没有 handle，其指针在下一次 `legado_sources` 调用前有效。
+- 同一 handle 可从多线程并发调用，无需加锁。JS 上下文、当前书源、请求上下文是
+  thread-local；cookie / HTTP / JS 存储加锁。返回值与 `legado_last_error` 按线程
+  各存一份。
+- `legado_search` / `legado_toc` / `legado_content` 会发 HTTP 并执行 JS，不要放在
+  UI 线程；多个书源可直接并发调用同一 handle。
 
-## 线程
+## 取消
 
-一个 handle 可以从多个线程同时调用，不需要在调用方加锁。JS 上下文、当前书源
-和请求上下文是 thread-local，cookie / HTTP / JS 存储有锁；`legado_search` 的
-返回值和 `legado_last_error` 也按调用线程各存一份。`legado_search` /
-`legado_toc` / `legado_content` 会发 HTTP 并执行 JS，不要放在 UI 线程；多个
-书源可以并发调用同一个 handle。
+```c
+legado_cancel(engine);   /* 任意线程 */
+```
+
+被取消的调用返回 `NULL`，`legado_last_error` 恰为 `LEGADO_CANCELLED`
+（`"cancelled"`）：
+
+```c
+if (!json) {
+    const char *error = legado_last_error(engine);
+    if (strcmp(error, LEGADO_CANCELLED) == 0) { /* 宿主自己叫停，不是失败 */ }
+    else { /* 真的失败 */ }
+}
+```
+
+- 只影响进行中的调用；之后的调用照常，无需重置。
+- 同一 handle 上的并发调用会被一起叫停。按任务隔离时使用多个 handle。
+- 检查点：HTTP 发送、读 body、重试退避、`concurrentRate` 排队、书源脚本、
+  下载落盘前（取消时不写文件）。
+- 已写出的字节不会回滚；落盘之后的取消不影响文件完整性。
+
+典型接法：worker 线程持有 handle，UI 线程只调 `legado_cancel`。
 
 ## 错误
 
-失败时返回 `NULL`，`legado_last_error(engine)` 给出原因（`legado_open` 失败时
-用 `legado_last_error(NULL)`）。错误字符串同样是下一次调用前有效。
+失败返回 `NULL`，原因见 `legado_last_error(engine)`（`legado_open` 失败时传
+`NULL`）。错误为英文短句，仅供展示；唯一有稳定值的是 `LEGADO_CANCELLED`，
+其余请按"失败"统一处理，不要匹配文案。
+
+## 超时与重试
+
+| 项 | 值 |
+| --- | --- |
+| 单请求总超时 | `timeoutSecs`，默认 15 秒 |
+| 建连超时 | 10 秒 |
+| 读超时（停滞判定） | 60 秒，仅对下载生效 |
+| 下载总超时 | 30 分钟 |
+| 重试 | 默认 2 次，退避 200ms × 次数 |
+| `429` / `503` | 按 `Retry-After` 等待，上限 10 秒 |
+
+- 非 2xx 也重试：部分站点首次请求返回 403 + 挑战 Cookie，重发即 200。
+- 书源 `concurrentRate`（`"1/300"` = 每 300ms 一次，`"3"` = 串行且间隔 3 秒）对
+  搜索 / 详情 / 目录 / 正文 / 下载生效，跨线程共享窗口。
+- 书源脚本硬上限 120 秒，用于终止死循环。
 
 ## 输入格式
 
 - `source_json`：单个 Legado 书源对象。
-- `book_json`：`legado_info` 返回的 JSON，或同字段的对象。
-- `chapter_json`：`BookChapter` 对象（`url` 必须有值）。
-- `legado_sources`：书源合集（数组或单个对象），返回
-  `{name, url, group, kind, enabled, comment, searchUrl, exploreUrl, hasJs}`。
+- `book_json`：`legado_info` 的返回值或同字段对象。
+- `chapter_json`：`BookChapter` 对象，`url` 必填。
+- `article_json`：`legado_rss_articles` 返回的数组元素。
+- `rules_json`：替换规则数组；`context_json`：`{"bookName","bookUrl","sourceUrl"}`。
 
 ## 示例（C）
 
@@ -69,19 +107,112 @@ int main(void) {
 }
 ```
 
-## Asuka 绑定
+## 下载
+
+文件型书源（`bookSourceType: 3`）无章节，下载链接在 `ruleBookInfo.downloadUrls`，
+每行一条（裸 URL 亦可）：
+
+```
+TXT::https://download.example/books/1.txt
+```
+
+```c
+const char *done = legado_download(engine, source_json, url, "/tmp/book.txt");
+/* {"path":"/tmp/book.txt","size":7172215,"contentType":"text/plain",
+ *  "charset":"gb18030","url":"…"} */
+```
+
+父目录自动创建；先写 `dest.part` 再 rename。字节原样落盘，`charset` 依次按响应头、
+BOM、UTF-8 合法性、GB18030 嗅探。请求使用书源的 header / cookie / 代理。
+
+## 登录
+
+1. 书源自登：在 `jsLib` 里用 `java.post` 提交表单，Cookie 与规则请求共用同一
+   per-source jar。示例见 [`sources/wenku8.json`](../sources/wenku8.json)。
+2. 宿主注入：WebView 登录后把 Cookie 交给引擎：
+
+```c
+legado_set_cookie(engine, source_json, source_url, cookie_header);
+```
+
+需要登录态的图片等资源，用 `legado_cookie_header` 取 Cookie 后自行请求。
+
+## 发现页翻页
+
+```json
+"exploreUrl": "[{\"title\":\"全部\",\"url\":\"/list?page={{page}}\"}]"
+```
+
+`legado_explore_page(engine, source_json, category_url, key, page)` 填入 `{{page}}`
+与 `{{key}}`（`key` 可为 `NULL`）；`legado_explore` 等价于 `key=""`、`page=1`。
+引擎不记分页状态，宿主每次 +1。
+
+## 导入
+
+`legado_import` 接受 `legado://import/…` 分享链接、裸 URL、`base64:`、data URL、
+gzip、裸 JSON，以及夹在文案中的链接。
+
+```c
+const char *json = legado_import(engine,
+    "新合集 legado://import/bookSource?src=https://example.com/all.json 收好");
+/* {"declaredKind":"bookSource","url":"https://example.com/all.json","origin":"url",
+ *  "bookSources":[…],"rssSources":[…],"replaceRules":[…],"unknown":0} */
+```
+
+- `engine` 可为 `NULL`（内嵌内容无需下载）；`src` 指向网络时需要 handle。
+- 分类按内容形状判定，不按链接声明的类型；`declaredKind` 仅表示链接意图。
+- 返回原始 JSON 对象，未知字段不丢。
+- `unknown` 为无法识别的对象个数，非零时提示用户。
+- 去重键：书源 `bookSourceUrl`，订阅源 `sourceUrl`。去重与合并策略由宿主决定。
+
+## 净化
+
+`legado_content` / `legado_rss_content` 返回原文；净化由宿主调用：
+
+```c
+const char *out = legado_replace(rules_json, raw_text, ctx_json, "content");
+/* {"text":"…","applied":[{"id":7,"name":"删本章说","changed":true}],
+ *  "skipped":[{"id":9,"reason":"scope"}],"errors":[{"id":3,"error":"…"}]} */
+```
+
+- `target` 传 `"title"` 才作用于章节标题（规则还需 `scopeTitle: true`）。
+- `skipped[].reason`：`disabled` / `scope` / `excludeScope` / `title` / `content` /
+  `emptyPattern`；`applied[].changed` 区分"执行了"与"真的改动了"。
+- `pattern` 按 Java 正则处理；`\Q…\E`、`(?x)` 报错并保持原文。
+- 替换保护 `<img>` / `[newpage]` / 内联样式脚本。
+
+## 订阅源
+
+订阅源是另一份 JSON（`sourceUrl` + `ruleArticles`），规则写法与书源通用。
+
+```c
+const char *list = legado_rss_articles(engine, rss_json, NULL /* 或 sortUrl 分类 */);
+/* {"articles":[{"title":…,"link":…,"pubDate":…,"description":…,"image":…,"order":0}],
+ *  "nextUrl":"https://…/page/2"} */
+
+const char *body = legado_rss_content(engine, rss_json, article_json);
+```
+
+- `nextUrl` 为空表示没有下一页；自动加载时再喂回 `legado_rss_articles`。
+- `singleUrl: true` 或未写 `ruleArticles` 表示 `sourceUrl` 即一篇文章。
+- `legado_rss_sources` 返回摘要：`{name, url, group, enabled, comment, sortUrl,
+  singleUrl, hasJs}`；`sortUrl` 原样返回，分类 JSON 由宿主解析。
+
+## 语言绑定
 
 ```asuka
 extern type LegadoEngine with release legado_close
 
 extern fn legado_open(config: CString) -> LegadoEngine?
 extern fn legado_close(engine: LegadoEngine)
+extern fn legado_cancel(engine: LegadoEngine)
 extern fn legado_last_error(engine: LegadoEngine) -> CString
 
 extern fn legado_sources(json: CString) -> CString?
 
 extern fn legado_search(engine: LegadoEngine, source: CString, key: CString, page: Int32) -> CString?
 extern fn legado_explore(engine: LegadoEngine, source: CString, url: CString) -> CString?
+extern fn legado_explore_page(engine: LegadoEngine, source: CString, url: CString, key: CString?, page: Int32) -> CString?
 extern fn legado_info(engine: LegadoEngine, source: CString, bookUrl: CString) -> CString?
 extern fn legado_toc(engine: LegadoEngine, source: CString, bookJson: CString) -> CString?
 extern fn legado_content(engine: LegadoEngine, source: CString, bookJson: CString, chapterJson: CString) -> CString?
@@ -91,9 +222,16 @@ extern fn legado_set_cookie(engine: LegadoEngine, source: CString, url: CString,
 
 extern fn legado_eval(engine: LegadoEngine, source: CString, script: CString, input: CString, baseUrl: CString) -> CString?
 extern fn legado_eval_rule(engine: LegadoEngine, source: CString, rule: CString, body: CString, baseUrl: CString) -> CString?
+
+extern fn legado_import(engine: LegadoEngine?, text: CString) -> CString?
+extern fn legado_replace(rules: CString, text: CString, context: CString?, target: CString?) -> CString?
+
+extern fn legado_rss_sources(json: CString) -> CString?
+extern fn legado_rss_articles(engine: LegadoEngine, source: CString, sortUrl: CString?) -> CString?
+extern fn legado_rss_content(engine: LegadoEngine, source: CString, article: CString) -> CString?
 ```
 
-调用方把 handle 放进一个 worker 持有，页面切换时不关闭。
+调用方把 handle 交给 worker 持有，页面切换时不关闭。
 
 ```asuka
 worker Legado {
@@ -116,44 +254,3 @@ worker Legado {
   }
 }
 ```
-
-## 下载
-
-文件型书源（如知轩藏书，`bookSourceType: 3`）没有章节，把下载链接放在
-`ruleBookInfo.downloadUrls` 里，每行一条：
-
-```
-TXT::https://download.example/books/1.txt
-EPUB::https://download.example/books/1.epub
-```
-
-裸 URL 也可以（名称由宿主决定）。然后：
-
-```c
-const char *done = legado_download(engine, source_json, url, "/tmp/book.txt");
-/* {"path":"/tmp/book.txt","size":7172215,"contentType":"text/plain",
- *  "charset":"gb18030","url":"…"} */
-```
-
-- 父目录会自动创建，写入先落到 `dest.part` 再 rename，失败不会留下半截文件。
-- 用书源的 header / cookie / 代理请求，能过和详情页同一层反爬（Cloudflare、
-  按 UA 投毒等）。
-- 字节原样落盘；`charset` 依次看响应头、BOM、UTF-8 合法性，最后回退
-  `gb18030`（中文 TXT 常见）。
-
-## 登录
-
-两条路：
-
-1. **书源自己登**（纯 HTTP，无 WebView）：在 `jsLib` 里用 `java.post` 提交登录表单，
-   把账号密码放在书源变量（`source.put`）里。登录拿到的 Cookie 与
-   `search/info/toc/content` 共用同一个 per-source cookie jar。示例见
-   [`sources/wenku8.json`](../sources/wenku8.json)。
-2. **宿主注入**：需要在 WebView 完成登录（验证码、扫码等）时，把 Cookie 交给引擎：
-
-```asuka
-legado_set_cookie(engine, sourceJson, sourceUrl, cookieHeaderFromWebView)
-```
-
-封面等资源如果需要登录态，用 `legado_cookie_header` 取 Cookie 后用调用方自己的
-HTTP 客户端请求，或用 `legado_eval` 中的 `java.ajax` 走引擎的 client。

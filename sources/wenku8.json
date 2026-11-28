@@ -25,8 +25,8 @@
   },
   "ruleBookInfo": {
     "name": "#content b@text",
-    "author": "((result.match(/小说作者[：:]\\s*([\\s\\S]*?)<\\/td>/)||[])[1]||'').trim()",
-    "kind": "((result.match(/文库分类[：:]\\s*([\\s\\S]*?)<\\/td>/)||[])[1]||'').trim()",
+    "author": "@js:((result.match(/小说作者[：:]\\s*([\\s\\S]*?)<\\/td>/)||[])[1]||'').trim()",
+    "kind": "@js:((result.match(/文库分类[：:]\\s*([\\s\\S]*?)<\\/td>/)||[])[1]||'').trim()",
     "intro": "@js:(result.match(/内容简介[：:]<\\/span>[\\s\\S]*?<span[^>]*>([\\s\\S]*?)<\\/span>/)||[])[1]",
     "lastChapter": "@js:(result.match(/最近章节[：:][\\s\\S]*?<a[^>]*>([\\s\\S]*?)<\\/a>/)||[])[1]",
     "updateTime": "@js:(result.match(/最后更新[：:]\\s*([\\d-]+)/)||[])[1]",

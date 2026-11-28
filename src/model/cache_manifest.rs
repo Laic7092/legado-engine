@@ -58,6 +58,9 @@ impl CacheManifest {
 
     /// 有效章节总数（同样剔除卷标题章）。
     pub fn real_chapter_count(&self) -> usize {
-        self.chapters.iter().filter(|chapter| !chapter.is_volume).count()
+        self.chapters
+            .iter()
+            .filter(|chapter| !chapter.is_volume)
+            .count()
     }
 }

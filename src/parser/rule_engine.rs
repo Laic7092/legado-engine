@@ -188,9 +188,8 @@ impl RuleEngine {
 
         // 规则里**夹着** `<js>…</js>`（例如 `class.book_cell<js>…</js>a`）：legado 的
         // `splitSourceRule` 会把它切成「CSS → JS → CSS」三段串联求值，上一段的
-        // 输出是下一段的输入。桌面端早先只认「开头是 js」的形态，这种中间夹 JS
-        // 的规则被整条丢给 CSS 引擎解析 —— 选择器里带 `<js>` 必然选不到，
-        // 症状是**搜索恒为 0 条**（发现页不走这段脚本，所以正常）。
+        // 输出是下一段的输入。只认「开头是 js」的形态不够：中间夹 `<js>` 的规则
+        // 整条丢给 CSS 引擎时选择器必然选不到，搜索会恒为 0 条。
         if split_rule_segments(list_rule)
             .iter()
             .any(|segment| matches!(segment, RuleSegment::Script(_)))
@@ -244,11 +243,18 @@ impl RuleEngine {
     }
 
     pub fn search_books(&self, source: &BookSource, body: &str, base_url: &str) -> Vec<SearchBook> {
-        with_source(source,|| {
-            if let Some(pattern) = source.book_url_pattern.as_deref().filter(|p| !p.trim().is_empty()) {
+        with_source(source, || {
+            if let Some(pattern) = source
+                .book_url_pattern
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
                 match regex::Regex::new(&format!("^(?:{pattern})$")) {
                     Ok(pattern) if pattern.is_match(base_url) => {
-                        return self.search_detail_fallback(source, body, base_url).into_iter().collect();
+                        return self
+                            .search_detail_fallback(source, body, base_url)
+                            .into_iter()
+                            .collect();
                     }
                     Err(err) => push_js_log(format!("[书籍地址规则] {err}")),
                     _ => {}
@@ -282,7 +288,7 @@ impl RuleEngine {
         body: &str,
         base_url: &str,
     ) -> Vec<SearchBook> {
-        with_source(source,|| {
+        with_source(source, || {
             let rule = source
                 .rule_explore
                 .clone()
@@ -308,7 +314,7 @@ impl RuleEngine {
         base_url: &str,
         book_url: &str,
     ) -> Book {
-        with_source(source,|| {
+        with_source(source, || {
             let rule = source.rule_book_info.clone().unwrap_or_default();
             let mut context = HashMap::new();
 
@@ -323,9 +329,8 @@ impl RuleEngine {
             // 而详情页自己也会通过 `kind` 字段补齐。
             // `init` 的返回值会替换后续字段规则的解析对象(legado 的
             // `java.setContent`)。但**执行失败或返回空串时必须保留原响应**:
-            // 早先这里 `unwrap_or_default()` 会把 body 换成空串, 结果是
-            // init 一失败, 详情页的书名/作者/简介全部解析不出来 ——
-            // 界面表现成「简介为空/只有搜索结果的摘要」。
+            // init 失败时保留原始 body 继续解析: 换成空串会让详情页的
+            // 书名/作者/简介全部为空。
             let original_body = body;
             let prepared = rule
                 .init
@@ -361,8 +366,7 @@ impl RuleEngine {
                 }
                 _ => {}
             }
-            let book =
-                parse_book_info_html(source, body, base_url, &rule, book_url, &mut context);
+            let book = parse_book_info_html(source, body, base_url, &rule, book_url, &mut context);
             // init 把解析对象换掉了(典型是 init 内部 `java.ajax` 打到了别处,
             // 拿到首页之类的无关页面), 此时书名等字段全为空。详情页响应本身
             // 往往可用, 不该因为 init 跑偏就丢掉全部信息 —— 用原始响应再解析
@@ -385,7 +389,12 @@ impl RuleEngine {
     }
 
     /// 供测试观察 `init` 规则的处理结果。
-    pub fn prepare_rule_body_for_test(&self, rule: &str, body: &str, base_url: &str) -> anyhow::Result<String> {
+    pub fn prepare_rule_body_for_test(
+        &self,
+        rule: &str,
+        body: &str,
+        base_url: &str,
+    ) -> anyhow::Result<String> {
         self.prepare_rule_body(rule, body, base_url)
     }
 
@@ -399,8 +408,11 @@ impl RuleEngine {
                     self.prepare_rule_body(remaining_rule, &output, base_url)
                 }
             }
-            ParseMode::Css | ParseMode::XPath => Ok(Self::eval_rule_elements(rule, body).first()
-                .and_then(|value| value["outerHtml"].as_str()).unwrap_or("").to_string()),
+            ParseMode::Css | ParseMode::XPath => Ok(Self::eval_rule_elements(rule, body)
+                .first()
+                .and_then(|value| value["outerHtml"].as_str())
+                .unwrap_or("")
+                .to_string()),
             _ => Ok(self.extract_content(rule, body)),
         }
     }
@@ -420,9 +432,8 @@ impl RuleEngine {
         // 目录列表规则里这种写法很常见：
         //   id.list@dl>a
         //   @js:var seen={};var out=[];for(...){...}out;
-        // 早先这里只看 `detect_mode`：规则开头不是 `@js:` 就判成 CSS，整条串
-        // （含 `\n@js:` 那几行）丢给 CSS 选择器，恒选不到 → **目录 0 章**，
-        // 而搜索/详情都正常，很容易误判成站点改版。
+        // 只看开头是否为 `@js:` 不够: 规则里 `\n@js:` 之后的脚本必须单独切出来,
+        // 否则整条串被当成 CSS 选择器, 目录恒为 0 章。
         //
         // 只处理「选择器在前、脚本在后」这一种（`has_trailing_script_segment`）。
         // 整条规则就是 `@js:` 的走原来的 JS 分支：那条路径的返回值可能是
@@ -446,8 +457,20 @@ impl RuleEngine {
             }
         }
         match self.detect_mode(list_rule, body) {
-            ParseMode::JsonPath => parse_chapter_list_json(body, base_url, rule, self.strip_mode_prefix(list_rule), context),
-            ParseMode::XPath => parse_chapter_list_xpath(body, base_url, rule, self.strip_mode_prefix(list_rule), context),
+            ParseMode::JsonPath => parse_chapter_list_json(
+                body,
+                base_url,
+                rule,
+                self.strip_mode_prefix(list_rule),
+                context,
+            ),
+            ParseMode::XPath => parse_chapter_list_xpath(
+                body,
+                base_url,
+                rule,
+                self.strip_mode_prefix(list_rule),
+                context,
+            ),
             ParseMode::Js => self.parse_chapter_list_js(body, base_url, rule, list_rule, context),
             ParseMode::Regex => self.parse_chapter_list_regex(body, base_url, rule, list_rule),
             ParseMode::Css => parse_chapter_list_html(body, base_url, rule, list_rule, context),
@@ -461,16 +484,15 @@ impl RuleEngine {
         base_url: &str,
         book_url: Option<&str>,
     ) -> (Vec<BookChapter>, Vec<String>) {
-        with_source(source,|| {
+        with_source(source, || {
             with_book_url(book_url, || {
                 let rule = source.rule_toc.clone().unwrap_or_default();
-            let mut context = HashMap::new();
-            let (list_rule, reverse) =
-                normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
-            let prepared_body = prepare_toc_body(body, base_url, &rule);
-            let (mut chapters, next_urls) = self.parse_toc_list(
-                &prepared_body, base_url, &rule, list_rule, &mut context,
-            );
+                let mut context = HashMap::new();
+                let (list_rule, reverse) =
+                    normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
+                let prepared_body = prepare_toc_body(body, base_url, &rule);
+                let (mut chapters, next_urls) =
+                    self.parse_toc_list(&prepared_body, base_url, &rule, list_rule, &mut context);
                 apply_toc_format_js(&mut chapters, rule.format_js.as_deref(), base_url);
                 if reverse {
                     chapters.reverse();
@@ -490,85 +512,96 @@ impl RuleEngine {
         base_url: &str,
         book_url: Option<&str>,
     ) -> String {
-        with_source(source,|| {
+        with_source(source, || {
             with_book_url(book_url, || {
                 let rule = source.rule_content.clone().unwrap_or_default();
                 let mut content_body = body.to_string();
 
-            if let Some(source_regex) = rule
-                .source_regex
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
-                content_body = apply_legado_regex(&content_body, source_regex);
-            }
-            if let Some(web_js) = rule.web_js.as_deref().filter(|s| !s.trim().is_empty()) {
-                match eval_js(self.strip_mode_prefix(web_js), &content_body, base_url) {
-                    Ok(processed) if !processed.trim().is_empty() => content_body = processed,
-                    Ok(_) => {}
-                    Err(e) => push_js_log(format!("[webJs] {e}")),
+                if let Some(source_regex) = rule
+                    .source_regex
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    content_body = apply_legado_regex(&content_body, source_regex);
                 }
-            }
-
-            if let Some(mut content_rule) = rule.content.clone() {
-                // Execute leading scripts before selecting their returned content,
-                // including aggregate rules ending in </js>$.content.
-                while matches!(self.detect_mode(&content_rule, &content_body), ParseMode::Js) {
-                    match eval_leading_js_rule(&content_rule, &content_body, base_url) {
-                        Ok((output, remaining_rule)) => {
-                            content_body = output;
-                            content_rule = remaining_rule.to_string();
-                            if content_rule.is_empty() { break; }
-                        }
-                        Err(err) => {
-                            push_js_log(format!("[正文 JS] {err}"));
-                            tracing::warn!("content js failed for {}: {err}", source.book_source_name);
-                            content_body.clear();
-                            content_rule.clear();
-                            break;
-                        }
+                if let Some(web_js) = rule.web_js.as_deref().filter(|s| !s.trim().is_empty()) {
+                    match eval_js(self.strip_mode_prefix(web_js), &content_body, base_url) {
+                        Ok(processed) if !processed.trim().is_empty() => content_body = processed,
+                        Ok(_) => {}
+                        Err(e) => push_js_log(format!("[webJs] {e}")),
                     }
                 }
-                let (pure, js) = extract_js(&content_rule);
-                let (selector_rule, script) = (pure.to_string(), js.map(str::to_string));
 
-                let mut content = if selector_rule.trim().is_empty() {
-                    content_body.clone()
-                } else {
-                    let selector_rule =
-                        self.process_inline_js(&selector_rule, &content_body, base_url);
-                    self.extract_content(&selector_rule, &content_body)
-                };
-
-                if let Some(script) = script.filter(|s| !s.trim().is_empty()) {
-                    match eval_js(&script, &content, base_url) {
-                        Ok(res) => content = res,
-                        Err(e) => {
-                            // JS 失败时保留选择器提取结果, 整条 JS 规则则返回空
-                            push_js_log(format!("[正文 JS] {e}"));
-                            tracing::warn!("content js failed for {}: {e}", source.book_source_name);
-                            if selector_rule.trim().is_empty() {
-                                content = String::new();
+                if let Some(mut content_rule) = rule.content.clone() {
+                    // Execute leading scripts before selecting their returned content,
+                    // including aggregate rules ending in </js>$.content.
+                    while matches!(
+                        self.detect_mode(&content_rule, &content_body),
+                        ParseMode::Js
+                    ) {
+                        match eval_leading_js_rule(&content_rule, &content_body, base_url) {
+                            Ok((output, remaining_rule)) => {
+                                content_body = output;
+                                content_rule = remaining_rule.to_string();
+                                if content_rule.is_empty() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                push_js_log(format!("[正文 JS] {err}"));
+                                tracing::warn!(
+                                    "content js failed for {}: {err}",
+                                    source.book_source_name
+                                );
+                                content_body.clear();
+                                content_rule.clear();
+                                break;
                             }
                         }
                     }
-                }
+                    let (pure, js) = extract_js(&content_rule);
+                    let (selector_rule, script) = (pure.to_string(), js.map(str::to_string));
 
-                if let Some(replace) = rule.replace_regex.as_deref() {
-                    if matches!(self.detect_mode(replace, &content), ParseMode::Js) {
-                        match eval_js(self.strip_mode_prefix(replace), &content, base_url) {
-                            Ok(result) => content = result,
-                            Err(err) => push_js_log(format!("[正文替换] {err}")),
-                        }
+                    let mut content = if selector_rule.trim().is_empty() {
+                        content_body.clone()
                     } else {
-                        content = apply_legado_regex(&content, replace);
+                        let selector_rule =
+                            self.process_inline_js(&selector_rule, &content_body, base_url);
+                        self.extract_content(&selector_rule, &content_body)
+                    };
+
+                    if let Some(script) = script.filter(|s| !s.trim().is_empty()) {
+                        match eval_js(&script, &content, base_url) {
+                            Ok(res) => content = res,
+                            Err(e) => {
+                                // JS 失败时保留选择器提取结果, 整条 JS 规则则返回空
+                                push_js_log(format!("[正文 JS] {e}"));
+                                tracing::warn!(
+                                    "content js failed for {}: {e}",
+                                    source.book_source_name
+                                );
+                                if selector_rule.trim().is_empty() {
+                                    content = String::new();
+                                }
+                            }
+                        }
                     }
+
+                    if let Some(replace) = rule.replace_regex.as_deref() {
+                        if matches!(self.detect_mode(replace, &content), ParseMode::Js) {
+                            match eval_js(self.strip_mode_prefix(replace), &content, base_url) {
+                                Ok(result) => content = result,
+                                Err(err) => push_js_log(format!("[正文替换] {err}")),
+                            }
+                        } else {
+                            content = apply_legado_regex(&content, replace);
+                        }
+                    }
+
+                    return content;
                 }
 
-                return content;
-            }
-
-            String::new()
+                String::new()
             })
         })
     }
@@ -725,9 +758,8 @@ impl RuleEngine {
         let Some(operator) = combo.delimiter.as_deref() else {
             // 没有组合符：只拿 `##` **之前**的规则主体求值，再把替换套上去。
             //
-            // 早先这里传的是**整个** content_rule，`##` 后面的替换正则被当成
-            // 提取器的一部分（`…p@text##广告行.*` 里的 `text##…` 不是合法
-            // 提取器），选择器结果取不出来 —— 症状是「正文解析为空」。
+            // 必须只把 `##` 之前的提取部分传给提取器: `##` 之后是替换正则,
+            // 混在一起会让 `text##…` 成为非法提取器, 正文解析为空。
             let value = self.extract_content_single(&combinable, content_body);
             return match replace_part {
                 Some(reg) => apply_legado_regex(&value, reg),
@@ -742,11 +774,22 @@ impl RuleEngine {
             .map(|part| self.extract_content_single(part, content_body))
             .collect();
         let joined = match operator {
-            "&&" => values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>().join(""),
+            "&&" => values
+                .into_iter()
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+                .join(""),
             // `||` 取第一个非空
-            "||" => values.into_iter().find(|v| !v.is_empty()).unwrap_or_default(),
+            "||" => values
+                .into_iter()
+                .find(|v| !v.is_empty())
+                .unwrap_or_default(),
             // `%%` 依次拼接（字段级每段是单值）
-            "%%" => values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>().join(""),
+            "%%" => values
+                .into_iter()
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+                .join(""),
             _ => return self.extract_content_single(content_rule, content_body),
         };
         // 替换作用于组合后的整体（legado 对每个 SourceRule 的最终结果做替换）。
@@ -776,11 +819,13 @@ impl RuleEngine {
                 })
                 .unwrap_or_default(),
             // XPath 同理：`AnalyzeByXPath.getString` 也是多值换行拼接。
-            ParseMode::XPath => html::select_xpath(content_body, self.strip_mode_prefix(content_rule))
-                .into_iter()
-                .filter(|v| !v.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
+            ParseMode::XPath => {
+                html::select_xpath(content_body, self.strip_mode_prefix(content_rule))
+                    .into_iter()
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
             ParseMode::Regex => {
                 // `@regex:pattern##find##replace`: 先提取, 再对结果做替换
                 let raw = self.strip_mode_prefix(content_rule);
@@ -793,7 +838,8 @@ impl RuleEngine {
             }
             _ => {
                 let doc = html::parse_document(content_body);
-                html::select_all_text(&doc, self.strip_mode_prefix(content_rule)).unwrap_or_default()
+                html::select_all_text(&doc, self.strip_mode_prefix(content_rule))
+                    .unwrap_or_default()
             }
         }
     }
@@ -810,7 +856,9 @@ impl RuleEngine {
                         .collect()
                 })
                 .unwrap_or_default(),
-            ParseMode::XPath => html::select_xpath(content_body, self.strip_mode_prefix(content_rule)),
+            ParseMode::XPath => {
+                html::select_xpath(content_body, self.strip_mode_prefix(content_rule))
+            }
             ParseMode::Regex => {
                 let raw = self.strip_mode_prefix(content_rule);
                 let (pattern, replace) = split_regex_rule(raw);
@@ -868,15 +916,17 @@ impl RuleEngine {
         // 选择器解析的话，分页链接永远取不到，多页正文只剩第一页。
         let mode = self.detect_mode(next_rule, body);
         let next_url = match mode {
-            ParseMode::JsonPath => serde_json::from_str::<Value>(body)
-                .ok()
-                .and_then(|v| jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(next_rule))),
+            ParseMode::JsonPath => serde_json::from_str::<Value>(body).ok().and_then(|v| {
+                jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(next_rule))
+            }),
             ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(next_rule))
                 .into_iter()
                 .find(|value| !value.trim().is_empty()),
-            ParseMode::Js | ParseMode::Regex => RuleEngine::eval_rule_on(next_rule, body, base_url, false)
-                .into_iter()
-                .find(|value| !value.trim().is_empty()),
+            ParseMode::Js | ParseMode::Regex => {
+                RuleEngine::eval_rule_on(next_rule, body, base_url, false)
+                    .into_iter()
+                    .find(|value| !value.trim().is_empty())
+            }
             ParseMode::Css => {
                 // 组合规则(`@href@js:…`)先按 `@js:` 切分：前半段是选择器,
                 // 后半段以取到的值为 `result` 求值。
@@ -888,13 +938,15 @@ impl RuleEngine {
                     html::select_text(&doc, self.strip_mode_prefix(pure)).unwrap_or_default()
                 };
                 match script {
-                    Some(script) if !script.trim().is_empty() => match eval_js(script, &extracted, base_url) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            push_js_log(format!("[nextContentUrl JS] {error}"));
-                            None
+                    Some(script) if !script.trim().is_empty() => {
+                        match eval_js(script, &extracted, base_url) {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                push_js_log(format!("[nextContentUrl JS] {error}"));
+                                None
+                            }
                         }
-                    },
+                    }
                     _ => Some(extracted),
                 }
             }
@@ -1149,7 +1201,6 @@ impl RuleEngine {
                 is_vip,
                 is_pay,
                 is_volume,
-                ..Default::default()
             });
         }
         (out, next_urls)
@@ -1203,7 +1254,6 @@ impl RuleEngine {
                 is_vip,
                 is_pay,
                 is_volume,
-                ..Default::default()
             });
         }
         (out, vec![])
@@ -1714,7 +1764,6 @@ fn chapters_from_elements(
             is_vip,
             is_pay,
             is_volume,
-            ..Default::default()
         });
     }
 
@@ -1858,7 +1907,6 @@ fn parse_chapter_list_xpath(
             is_vip,
             is_pay,
             is_volume,
-            ..Default::default()
         });
     }
 
@@ -1967,14 +2015,10 @@ fn eval_chapter_fields(
         base_url,
         ctx,
     );
-    let is_volume = eval_field_json_with_ctx(
-        rule.is_volume.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    )
-    .map(is_truthy)
-    .unwrap_or(false);
+    let is_volume =
+        eval_field_json_with_ctx(rule.is_volume.as_deref().unwrap_or(""), item, base_url, ctx)
+            .map(is_truthy)
+            .unwrap_or(false);
     let is_vip =
         eval_field_json_with_ctx(rule.is_vip.as_deref().unwrap_or(""), item, base_url, ctx)
             .map(is_truthy)
@@ -1983,7 +2027,14 @@ fn eval_chapter_fields(
         eval_field_json_with_ctx(rule.is_pay.as_deref().unwrap_or(""), item, base_url, ctx)
             .map(is_truthy)
             .unwrap_or(false);
-    RawChapter { title, url, tag, is_volume, is_vip, is_pay }
+    RawChapter {
+        title,
+        url,
+        tag,
+        is_volume,
+        is_vip,
+        is_pay,
+    }
 }
 
 /// 并发地对全部 item 求值章节字段，结果按原顺序返回。
@@ -2070,21 +2121,21 @@ fn parse_chapter_list_json(
     // `mapAsync(threadCount)`）。两个条件缺一不可：
     //  - 章节少时开线程的固定开销（上下文重建约 6ms/线程）反而更慢；
     //  - 规则不含 JS 时单条求值是微秒级，并发没有收益。
-    let raw_chapters: Vec<RawChapter> = if items.len() >= TOC_PARALLEL_MIN_ITEMS
-        && toc_rule_has_js(rule)
-    {
-        eval_chapter_fields_parallel(rule, &items, base_url)
-    } else {
-        items
-            .iter()
-            .map(|item| eval_chapter_fields(rule, item, base_url, ctx))
-            .collect()
-    };
+    let raw_chapters: Vec<RawChapter> =
+        if items.len() >= TOC_PARALLEL_MIN_ITEMS && toc_rule_has_js(rule) {
+            eval_chapter_fields_parallel(rule, &items, base_url)
+        } else {
+            items
+                .iter()
+                .map(|item| eval_chapter_fields(rule, item, base_url, ctx))
+                .collect()
+        };
 
     let mut seen_urls = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(raw_chapters.len());
     for raw in raw_chapters {
-        let url_abs = finalize_chapter_url(base_url, &raw.url, &raw.title, raw.is_volume, out.len());
+        let url_abs =
+            finalize_chapter_url(base_url, &raw.url, &raw.title, raw.is_volume, out.len());
 
         if seen_urls.contains(&url_abs) {
             continue;
@@ -2099,7 +2150,6 @@ fn parse_chapter_list_json(
             is_vip: raw.is_vip,
             is_pay: raw.is_pay,
             is_volume: raw.is_volume,
-            ..Default::default()
         });
     }
 
@@ -2246,9 +2296,8 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
         // `attrs` 会误伤普通 JSON 源 —— `attrs` 是常见字段名, 一旦响应里有它
         // 且规则名恰好是裸属性名, 就会取到错误的值。三者齐备是元素快照的
         // 充分特征(见 element_snapshot / snapshot_from_fragment)。
-        let looks_like_snapshot = obj.contains_key("attrs")
-            && obj.contains_key("tag")
-            && obj.contains_key("outerHtml");
+        let looks_like_snapshot =
+            obj.contains_key("attrs") && obj.contains_key("tag") && obj.contains_key("outerHtml");
         if looks_like_snapshot {
             if let Some(attr) = obj.get("attrs").and_then(|a| a.get(rule)) {
                 return jsonpath::value_to_string(attr);
@@ -2272,7 +2321,7 @@ fn resolve_asset_url(base: &str, url: &str) -> String {
     resolve_url(base, crate::crawler::url_analyzer::split_url_options(url).0)
 }
 
-fn resolve_url(base: &str, url: &str) -> String {
+pub fn resolve_url(base: &str, url: &str) -> String {
     let base = normalize_source_url(base);
     // URL 选项（`,{"body":…,"method":"POST"}`）**必须保留**。
     //
@@ -2282,9 +2331,8 @@ fn resolve_url(base: &str, url: &str) -> String {
     //
     //   url = GetUrl(path, params);   // → "https://…/info,{\"body\":…,\"method\":\"POST\"}"
     //
-    // 早先这里用 `strip_url_config` 剥掉选项、只留接口路径，请求于是变成无 body 的
-    // GET，服务端拿不到 bookId —— 症状是**搜索有结果但每本书地址都一样、点进去
-    // 详情页/目录全空**。
+    // 这里不能剥掉 URL 选项: 剥成纯路径后请求变成无 body 的 GET, 服务端拿不到
+    // bookId, 所有书会返回同一个地址。
     //
     // 相对地址拼接时仍按纯 URL 处理（取选项左边部分），拼好后再把选项接回去。
     let (url_only, options) = crate::crawler::url_analyzer::split_url_options(url);
@@ -2360,7 +2408,10 @@ fn interpolate_json_templates(
             }
             let json_text = serde_json::to_string(v).unwrap_or_default();
             let values = RuleEngine::eval_rule_on(trimmed_rule, &json_text, base_url, false);
-            return values.into_iter().find(|s| !s.is_empty()).unwrap_or_default();
+            return values
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or_default();
         }
 
         if expr.starts_with('$') {
@@ -2375,14 +2426,12 @@ fn interpolate_json_templates(
             return val;
         }
 
-        match eval_js(
+        eval_js(
             expr,
             &serde_json::to_string(v).unwrap_or_default(),
             base_url,
-        ) {
-            Ok(res) => res,
-            Err(_) => String::new(),
-        }
+        )
+        .unwrap_or_default()
     })
     .into_owned()
 }
@@ -2418,7 +2467,10 @@ fn interpolate_common_templates(
                 // 单值语义：`{{@@class.tag@text}}` 取第一个命中。
                 //（`list=true` 会把整页同类元素拼成一串，模板里只需要一个值。）
                 let values = RuleEngine::eval_rule_on(trimmed_rule, input, base_url, false);
-                return values.into_iter().find(|s| !s.is_empty()).unwrap_or_default();
+                return values
+                    .into_iter()
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_default();
             }
             if let Some(val) = ctx.get(expr) {
                 return val.clone();
@@ -2427,7 +2479,9 @@ fn interpolate_common_templates(
             // （`$ is not defined`）。尝试把 input 按 JSON 解析后走 JSONPath, 失败则留空。
             if let Some(json_path) = expr.strip_prefix("$.") {
                 if let Ok(v) = serde_json::from_str::<Value>(input) {
-                    if let Some(val) = jsonpath::jsonpath_first_string(&v, &format!("$.{json_path}")) {
+                    if let Some(val) =
+                        jsonpath::jsonpath_first_string(&v, &format!("$.{json_path}"))
+                    {
                         return val;
                     }
                 }
@@ -2531,11 +2585,12 @@ fn regex_extract_first(text: &str, pattern: &str) -> Option<String> {
     }
     let re = regex::Regex::new(pattern).ok()?;
     let caps = re.captures(text)?;
-    Some(caps
-        .get(1)
-        .or_else(|| caps.get(0))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_default())
+    Some(
+        caps.get(1)
+            .or_else(|| caps.get(0))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default(),
+    )
 }
 
 /// 取全部匹配(与 `regex_extract_first` 同样的取值规则)。
@@ -2597,9 +2652,8 @@ enum RuleSegment<'a> {
 /// ```
 ///
 /// legado 用 `JS_PATTERN` 把 `<js>` 段单独抽出来，剩下的文本前后各成一段，
-/// 逐段串联求值（上一段的输出喂给下一段）。桌面端早先只认「规则以 JS 开头」
-/// 的形态，中间夹 JS 时整条规则被当成一个 CSS 选择器 —— 选择器里含 `<js>`
-/// 自然选不到任何东西，搜索于是恒为 0 条。
+/// 逐段串联求值（上一段的输出喂给下一段）。只认「规则以 JS 开头」时, 中间夹
+/// `<js>` 的规则会被当成一个 CSS 选择器, 必然选不到任何东西。
 /// 规则是否是「选择器段 + 后续脚本段」（脚本不在开头）。
 ///
 /// 只用于列表规则的分流，判断依据是：规则里含 `@js:` / `<js>`，且第一个脚本
@@ -2789,7 +2843,9 @@ fn eval_field_html_with_ctx(
     // 反过来的话，该源的 `class.title@html||$.title##<span …>|<.*?>` 会把
     // `##<span…>|<.*?>` 并进第二个候选，`||` 取走第一个非空的 `class.title@html`
     // 之后替换永远不执行 —— 书名里于是留着 `<h4 class="title">…` 标签。
-    let has_combo = split_top_level(rule, &["&&", "||", "%%"]).delimiter.is_some();
+    let has_combo = split_top_level(rule, &["&&", "||", "%%"])
+        .delimiter
+        .is_some();
     if has_combo {
         // `##` 之前的部分才是可组合的规则主体，之后是替换段（可能只有一段 =
         // 删除匹配内容）。
@@ -2824,9 +2880,7 @@ fn eval_field_html_with_ctx(
             // && 拼接所有非空
             "&&" if !results.is_empty() => Some(results.join("")),
             // || 取第一个非空
-            "||" => or_results
-                .into_iter()
-                .find(|v| !v.is_empty()),
+            "||" => or_results.into_iter().find(|v| !v.is_empty()),
             // %% 按索引交织(字段级这里的每一项是单值, 等价于依次拼接)
             "%%" if !results.is_empty() => Some(results.join("")),
             _ => None,
@@ -2861,8 +2915,7 @@ fn eval_field_html_single_with_ctx(
         put_rule_variable(&key, &val, base_url);
     }
     let rule = stripped.as_str();
-    if rule.starts_with("@css:") {
-        let pure = &rule[5..];
+    if let Some(pure) = rule.strip_prefix("@css:") {
         return eval_field_html_with_ctx(pure, el, base_url, ctx);
     }
     if rule.starts_with("@xpath:") {
@@ -2882,8 +2935,8 @@ fn eval_field_html_single_with_ctx(
     // 模板插值(`{{...}}`)的上下文必须是**元素 HTML**，不能是纯文本。
     //
     // `{{@@class.tag@text}}` 是该源的写法：`@@` 后面是 CSS 选择器，要作用在
-    // 当前元素上再取 `@text`。早先这里传 `textNodes`（纯文本），选择器在纯文本上
-    // 什么都选不到，于是该模板恒为空 —— `ruleExplore.kind` 因此变成 `",,,,,"`。
+    // 当前元素上再取 `@text`。入参必须是 HTML: 传纯文本时选择器选不到任何东西,
+    // 模板恒为空。
     let input = el.html();
     let interpolated_rule = interpolate_common_templates(rule, &input, base_url, ctx);
     let had_templates = interpolated_rule != rule;
@@ -2895,8 +2948,8 @@ fn eval_field_html_single_with_ctx(
         //（JSoup Element 会字符串化成 outerHtml）。脚本普遍依赖这一点，例如该源
         // 的 bookUrl 规则 `java.getString("@href||$.url")` 就是从当前元素取 href。
         //
-        // 早先这里给空串，脚本面对空内容什么也取不到，`bookUrl` 于是落到
-        // fallback 拼出 `.../column//`（ID 为空），详情页/目录/正文全部失败。
+        // 必须传 HTML: 给空串时脚本取不到内容, `bookUrl` 会落到缺 id 的
+        // fallback, 详情/目录/正文全部失败。
         el.html()
     } else {
         html::select_text_from_element(el, pure).unwrap_or_default()
@@ -2957,12 +3010,10 @@ fn eval_field_html_doc_with_ctx(
     if rule.is_empty() {
         return None;
     }
-    if rule.starts_with("@css:") {
-        let pure = &rule[5..];
+    if let Some(pure) = rule.strip_prefix("@css:") {
         return eval_field_html_doc_with_ctx(pure, doc, base_url, ctx);
     }
-    if rule.starts_with("@xpath:") {
-        let pure = &rule[7..];
+    if let Some(pure) = rule.strip_prefix("@xpath:") {
         // 取第一个**非空白**结果: `//text()` 命中的首个节点常是排版空白,
         // 只取首项会把字段读成空白串(见 `eval_field_xpath_single_with_ctx`)。
         return html::select_xpath(&doc.html(), pure)
@@ -2988,7 +3039,7 @@ fn eval_field_html_doc_with_ctx(
     // 之后的选择器整段丢掉，脚本输出于是被当成字段值（简介变成整页 HTML）。
     if let Some(value) = eval_field_rule_chain(&pure_rule, &doc.html(), base_url) {
         return Some(match regex_part {
-            Some(reg) => apply_legado_regex(&value, &reg),
+            Some(reg) => apply_legado_regex(&value, reg),
             None => value,
         });
     }
@@ -3034,9 +3085,8 @@ fn eval_field_html_doc_with_ctx(
 /// tag.p.1:2@text
 /// ```
 ///
-/// 也就是「先用脚本另抓一页，再在那一页上选元素」。桌面端早先只取 `</js>`
-/// **之前**的规则、把后面的选择器整段丢掉，脚本的输出于是被原样当成字段值 ——
-/// 症状是**简介显示成一整页 HTML 源码**（详情弹窗里那屏 `<!DOCTYPE html…`）。
+/// 也就是「先用脚本另抓一页，再在那一页上选元素」。`</js>` **之后**的选择器
+/// 必须继续执行, 丢掉它会把脚本输出（整页 HTML）原样当成字段值。
 ///
 /// 返回 `None` 表示「这条规则不需要走链式路径」，交给原有单段逻辑。
 fn eval_field_rule_chain(rule: &str, input_html: &str, base_url: &str) -> Option<String> {
@@ -3045,15 +3095,12 @@ fn eval_field_rule_chain(rule: &str, input_html: &str, base_url: &str) -> Option
         return None;
     }
     // 只有「脚本段之后还跟着规则段」才接管，其余保持原路径不变。
-    let Some(script_index) = segments
+    let script_index = segments
         .iter()
-        .position(|segment| matches!(segment, RuleSegment::Script(_)))
-    else {
-        return None;
-    };
-    let last_rule_index = segments
-        .iter()
-        .rposition(|segment| matches!(segment, RuleSegment::Rule(text) if !text.trim().is_empty()))?;
+        .position(|segment| matches!(segment, RuleSegment::Script(_)))?;
+    let last_rule_index = segments.iter().rposition(
+        |segment| matches!(segment, RuleSegment::Rule(text) if !text.trim().is_empty()),
+    )?;
     if last_rule_index <= script_index {
         return None;
     }
@@ -3268,7 +3315,10 @@ fn select_xpath_scope<'a>(
 ///
 /// 只有以 `/` 开头、且当前不是文档根时才补一个 `.`(`//a` → `.//a`,
 /// `/div/a` → `./div/a`); 其余(相对路径、`(` 开头的表达式)原样返回。
-fn relativize_xpath<'a>(node: sxd_xpath::nodeset::Node<'_>, xpath: &'a str) -> std::borrow::Cow<'a, str> {
+fn relativize_xpath<'a>(
+    node: sxd_xpath::nodeset::Node<'_>,
+    xpath: &'a str,
+) -> std::borrow::Cow<'a, str> {
     use sxd_xpath::nodeset::Node;
     if matches!(node, Node::Root(_)) || !xpath.starts_with('/') {
         return std::borrow::Cow::Borrowed(xpath);
@@ -3322,7 +3372,9 @@ fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<St
 
 fn eval_json_item_js(script: &str, item: &Value, base_url: &str) -> anyhow::Result<String> {
     let input = item_raw_string(item);
-    let pipe_row = item.as_array().is_some_and(|items| items.iter().all(Value::is_string));
+    let pipe_row = item
+        .as_array()
+        .is_some_and(|items| items.iter().all(Value::is_string));
     if !item.is_object() && (!item.is_array() || pipe_row) {
         return eval_js(script, &input, base_url);
     }
@@ -3365,9 +3417,18 @@ fn eval_json_item_js(script: &str, item: &Value, base_url: &str) -> anyhow::Resu
 /// 只在用到时注入元素对象, 其余脚本保持"`result` 是 HTML/文本"的既有语义,
 /// 避免影响大量依赖字符串 result 的书源。
 fn script_uses_element_api(script: &str) -> bool {
-    ["select(", ".html(", ".ownText(", ".attr(", ".attr (", ".hasAttr(", ".children(", ".parent("]
-        .iter()
-        .any(|needle| script.contains(needle))
+    [
+        "select(",
+        ".html(",
+        ".ownText(",
+        ".attr(",
+        ".attr (",
+        ".hasAttr(",
+        ".children(",
+        ".parent(",
+    ]
+    .iter()
+    .any(|needle| script.contains(needle))
 }
 
 /// 把 `scraper` 元素转成元素快照绑定(供 `__wrapElement` 还原)。
@@ -3430,7 +3491,11 @@ fn is_element_snapshot(item: &Value) -> bool {
 /// (或其唯一祖先容器)。
 fn snapshot_wrapper(tag: &str) -> (&'static str, &'static str, &'static str) {
     match tag.trim().to_ascii_lowercase().as_str() {
-        "tr" => ("<table><tbody>", "</tbody></table>", "body > table > tbody > tr"),
+        "tr" => (
+            "<table><tbody>",
+            "</tbody></table>",
+            "body > table > tbody > tr",
+        ),
         "td" => (
             "<table><tbody><tr>",
             "</tr></tbody></table>",
@@ -3593,14 +3658,14 @@ fn eval_field_json_single_with_ctx(
 
     let mut text = if pure.is_empty() {
         "".to_string()
-    } else if pure.contains("{{") && pure.contains("}}") {
-        pure.to_string()
-    } else if pure.contains('/')
+    } else if (pure.contains("{{") && pure.contains("}}"))
+        || pure.contains('/')
         || pure.contains('?')
         || pure.contains('&')
         || pure.contains('=')
         || pure.contains(',')
     {
+        // 模板或「像 URL/参数」的规则直接当字面量, 不再去 JSON 里取字段。
         pure.to_string()
     } else {
         pick_json_field(v, Some(pure)).unwrap_or_default()
@@ -3648,7 +3713,9 @@ fn split_inline_put_rules(rule: &str) -> (String, Vec<(String, String)>) {
     let mut puts = Vec::new();
     let mut last = 0usize;
     for captures in re.captures_iter(rule) {
-        let Some(matched) = captures.get(0) else { continue };
+        let Some(matched) = captures.get(0) else {
+            continue;
+        };
         rest.push_str(&rule[last..matched.start()]);
         last = matched.end();
         let Some(inner) = captures
@@ -3681,7 +3748,11 @@ fn split_inline_put_rules(rule: &str) -> (String, Vec<(String, String)>) {
 /// chapter/book/source 变量链（与 JS `java.get(key)` 同一存储）,
 /// 否则跨阶段（详情 @put → 正文 java.get）取不到值。
 fn put_rule_variable(key: &str, val: &str, base_url: &str) {
-    let script = format!("java.put({}, {})", serde_json::json!(key), serde_json::json!(val));
+    let script = format!(
+        "java.put({}, {})",
+        serde_json::json!(key),
+        serde_json::json!(val)
+    );
     let _ = eval_js(&script, "", base_url);
 }
 
@@ -3691,8 +3762,7 @@ fn try_put_get_html(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -3708,8 +3778,7 @@ fn try_put_get_html(
         }
         return Some("".to_string());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -3724,8 +3793,7 @@ fn try_put_get_html_doc(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -3741,8 +3809,7 @@ fn try_put_get_html_doc(
         }
         return Some("".to_string());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -3757,8 +3824,7 @@ fn try_put_get_json(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -3774,8 +3840,7 @@ fn try_put_get_json(
         }
         return Some("".to_string());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -3790,8 +3855,7 @@ fn try_put_get_xpath(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -3807,8 +3871,7 @@ fn try_put_get_xpath(
         }
         return Some(String::new());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -3831,10 +3894,9 @@ fn apply_legado_regex(text: &str, regex_part: &str) -> String {
     }
 
     // `###` 后缀 = 只替换第一个匹配（legado `replaceFirst`）。
-    let (regex_part, first_only) = if regex_part.ends_with("###") {
-        (&regex_part[..regex_part.len() - 3], true)
-    } else {
-        (regex_part, false)
+    let (regex_part, first_only) = match regex_part.strip_suffix("###") {
+        Some(rest) => (rest, true),
+        None => (regex_part, false),
     };
 
     // legado `SourceRule`（AnalyzeRule.kt:762-773）把 `##` 之后**只当两段**看：
@@ -3902,7 +3964,11 @@ fn strip_mode_prefix(rule: &str) -> &str {
     rule
 }
 
-fn eval_leading_js_rule<'a>(rule: &'a str, body: &str, base_url: &str) -> anyhow::Result<(String, &'a str)> {
+fn eval_leading_js_rule<'a>(
+    rule: &'a str,
+    body: &str,
+    base_url: &str,
+) -> anyhow::Result<(String, &'a str)> {
     let (script, remaining_rule) = split_leading_js_rule(rule);
     Ok((eval_js(script, body, base_url)?, remaining_rule))
 }
@@ -4000,14 +4066,21 @@ fn parse_js_output_items(output: &str) -> Option<Vec<Value>> {
     // JSON 数组 / 对象 → 现有行为
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return match value {
-            Value::Array(items) => Some(items.into_iter().map(|item| {
-                if let Value::String(raw) = &item {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-                        if parsed.is_object() || parsed.is_array() { return parsed; }
-                    }
-                }
-                item
-            }).collect()),
+            Value::Array(items) => Some(
+                items
+                    .into_iter()
+                    .map(|item| {
+                        if let Value::String(raw) = &item {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                                if parsed.is_object() || parsed.is_array() {
+                                    return parsed;
+                                }
+                            }
+                        }
+                        item
+                    })
+                    .collect(),
+            ),
             Value::Object(_) => Some(vec![value]),
             _ => None,
         };
@@ -4339,10 +4412,9 @@ mod tests {
     use crate::model::book_source::BookSource;
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
 
-
     /// 空字段规则必须给空值。某书源 `ruleExplore.kind` / `updateTime` 是空串,
-    /// 早先会落到"纯 JS 规则"分支返回**当前元素的 outerHtml**, 于是整段 `<li>`
-    /// 被当成字段值, 详情页标签显示 HTML 源码。对齐 legado
+    /// 空规则必须返回空串, 不能落到"纯 JS 规则"分支返回当前元素的 outerHtml
+    /// （否则整段 `<li>` 会被当成字段值）。对齐 legado
     /// (`AnalyzeRule.getString` 首行 `TextUtils.isEmpty(ruleStr) -> ""`).
     #[test]
     fn test_empty_field_rule_yields_none_not_element_html() {
@@ -4560,7 +4632,10 @@ mod tests {
         assert_eq!(results[0].name, "Alpha");
         assert_eq!(results[0].author, "Tester");
         assert_eq!(results[0].book_url, "https://m.example.com/book/1001/");
-        assert_eq!(results[0].cover_url.as_deref(), Some("https://source.example/c1.jpg"));
+        assert_eq!(
+            results[0].cover_url.as_deref(),
+            Some("https://source.example/c1.jpg")
+        );
         assert_eq!(results[1].name, "Beta");
         assert_eq!(results[1].book_url, "https://m.example.com/book/1002/");
     }
@@ -4727,7 +4802,8 @@ mod tests {
             </div>
         "#;
 
-        let (chapters, next_urls) = engine.chapter_list(&source, body, "https://books.example", None);
+        let (chapters, next_urls) =
+            engine.chapter_list(&source, body, "https://books.example", None);
         assert!(next_urls.is_empty());
         assert_eq!(chapters.len(), 2);
         assert_eq!(chapters[0].url, "https://books.example/1");
@@ -4833,7 +4909,12 @@ mod tests {
         };
         let body = r#"<div class="con"><p>第一段</p><p>第二段</p></div>"#;
 
-        let content = engine.content(&source, body, "https://source.example/1/2", Some("https://source.example/book/1"));
+        let content = engine.content(
+            &source,
+            body,
+            "https://source.example/1/2",
+            Some("https://source.example/book/1"),
+        );
         // addComment 未定义 → JS 抛错 → 回退保留选择器提取结果
         // legado 的 `@html` 语义是 outerHtml(含元素自身标签)
         assert_eq!(
@@ -5006,7 +5087,8 @@ mod tests {
     #[test]
     #[ignore]
     fn parallel_toc_matches_serial_on_real_1826_chapters() {
-        let Ok(src_raw) = std::fs::read_to_string(r"E:\Desktop\reader\.tmp-issue22\src.json") else {
+        let Ok(src_raw) = std::fs::read_to_string(r"E:\Desktop\reader\.tmp-issue22\src.json")
+        else {
             eprintln!("skip: fixture missing");
             return;
         };
@@ -5067,8 +5149,10 @@ mod tests {
 
         assert_eq!(out.len(), items.len(), "并发不能丢章");
         // source.getKey() 丢失时这里会变成 "/0.html" 之类的相对地址。
-        assert_eq!(out[0].url, "https://c.example.test/0.html", "并发线程必须拿到书源上下文");
+        assert_eq!(
+            out[0].url, "https://c.example.test/0.html",
+            "并发线程必须拿到书源上下文"
+        );
         assert_eq!(out[0].title, "第0章");
     }
 }
-

@@ -81,9 +81,13 @@ pub fn apply_rules_with_timeout(
 
     // 截止时刻在进入沙盒前算好：handler 只做一次 Instant 比较，开销可以忽略。
     let deadline = Instant::now() + timeout;
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    // 取消也走同一条中断路径: 正文净化是同步调用, 用户按返回时同样该停。
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        crate::cancel::requested() || Instant::now() >= deadline
+    })));
 
-    let context = Context::full(&runtime).map_err(|error| format!("初始化脚本上下文失败: {error}"))?;
+    let context =
+        Context::full(&runtime).map_err(|error| format!("初始化脚本上下文失败: {error}"))?;
 
     // 输入以 JSON 字面量注入：JSON 是 JS 的子集，直接当表达式求值即可，不必手工转义。
     // U+2028/U+2029 在旧引擎里不能出现在字符串字面量中，先转成转义序列。
@@ -101,7 +105,8 @@ pub fn apply_rules_with_timeout(
         text,
         rules.iter().map(|rule| rule.pattern.as_str()),
     );
-    let protected_literal = json_literal(&serde_json::Value::String(protected.content().to_string()));
+    let protected_literal =
+        json_literal(&serde_json::Value::String(protected.content().to_string()));
 
     let result = context.with(|ctx| {
         let setup = format!(
@@ -119,13 +124,22 @@ pub fn apply_rules_with_timeout(
     // 直接透传会让用户看到一句莫名其妙的英文；这里按是否超时换成可操作的提示。
     match result {
         Err(_) if Instant::now() >= deadline => Err(format!(
-            "净化脚本执行超时（超过 {} 秒），已中止；请检查规则里是否有死循环",
-            timeout.as_secs_f32().round() as u64
+            "净化脚本执行超时（超过 {}），已中止；请检查规则里是否有死循环",
+            human_duration(timeout)
         )),
         // 跑完规则后把受保护的片段换回来。放在这里而不是沙盒内部：还原是纯字符串
         // 操作，没必要再塞进 JS 上下文里多一次注入。
         Ok(output) => Ok(protected.restore(&output)),
         other => other,
+    }
+}
+
+/// 超时提示里的时长。300ms 的规则四舍五入成 "0 秒" 会让人以为没设超时。
+fn human_duration(timeout: Duration) -> String {
+    if timeout.as_secs() >= 1 {
+        format!("{} 秒", timeout.as_secs_f32().round() as u64)
+    } else {
+        format!("{} 毫秒", timeout.as_millis())
     }
 }
 

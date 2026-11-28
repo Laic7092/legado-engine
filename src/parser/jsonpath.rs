@@ -6,8 +6,8 @@ use serde_json::Value;
 ///
 /// - jayway 里 `.[?(@.x)]` 的 `.` 是**递归下降**的起点，等价于 `$..[?(@.x)]`，
 ///   会在整棵文档里找所有带 `x` 的对象；
-/// - `jsonpath_lib` 不认 `.[?(…)]`，会报语法错误；而早先的实现在「不以 `$` 开头」
-///   时把前导点**剥掉**再拼 `$.`，得到 `$.?(@.x)` —— 依然非法，于是恒定 0 项。
+/// - `jsonpath_lib` 不认 `.[?(…)]`，会报语法错误；也不要把前导点剥掉再拼 `$.`
+///   （`$.?(@.x)` 同样非法，结果恒为 0 项），应补成 `$.[?(@.x)]`。
 ///
 /// 书源里 `.[?(@.bookName)]||.[?(@.title)]` 这种写法很常见（不写 `$`、不写 `..`，
 /// 靠 jayway 的宽松语义做「全文档找书」），桌面端因此搜索恒 0 条，而手机端正常。
@@ -59,7 +59,7 @@ pub fn jsonpath_first_string(value: &Value, rule: &str) -> Option<String> {
         return Some(rendered);
     }
     let res = jsonpath_query(value, rule);
-    res.first().and_then(|v| value_to_string(v))
+    res.first().and_then(value_to_string)
 }
 
 pub fn value_to_string(v: &Value) -> Option<String> {
@@ -108,9 +108,8 @@ fn render_embedded_paths(value: &Value, rule: &str) -> Option<String> {
 ///   `{{$.bookId||$.bid}}` 兼容新旧两套字段名。
 /// - `&&`：全部求值后按行拼接。
 ///
-/// 早先这里把整串当成一条 JSONPath 直接查，`$.bookId||$.bid` 在引擎里是非法
-/// 语法，结果恒为空 —— 于是 `bookId` 取空、`bookUrl` 拼出来就只剩接口路径，
-/// 症状是「搜索有结果但每本书的地址都一样、点进去打不开」。
+/// 必须按 `||` / `&&` 拆开求值：整串当成一条 JSONPath 是非法语法，结果恒为空，
+/// `bookUrl` 会只剩接口路径（每本书地址都一样）。
 fn resolve_inner_path(value: &Value, path: &str) -> String {
     // `||` 优先: 回退链只要第一个非空即可; 没有再退到 `&&` 的拼接语义。
     if path.contains("||") {
